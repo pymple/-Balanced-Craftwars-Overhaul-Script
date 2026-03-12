@@ -1,4 +1,4 @@
---[[ Pimple v6.0 - pimpleHUB UI Version (Fixed + Item Tracker + Universal Gun) ]]
+--[[ Pimple v6.0 ]]
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -14,27 +14,30 @@ local Flags = {
     AutoSwing = false,
     AutoGun = false,
     AutoTeleport = false,
+    AutoSummon = false,
+    SmartGunCooldown = true,
+    EnemyESP = false,
     TeleportPosition = "Back",
     TeleportDistance = 5,
     TargetPriority = "Nearest",
     SwingCooldown = 0.15,
     GunCooldown = 0.25,
+    SummonCooldown = 1.0,
     WalkSpeed = 16,
     JumpPower = 50,
     AutoReequip = true,
     SpeedEnforce = true,
 }
 
-local SwingTimer, GunTimer, SpeedTimer = 0, 0, 0
+local SwingTimer, GunTimer, SpeedTimer, SummonTimer = 0, 0, 0, 0
 local CurrentTarget = nil
 local LastEquippedWeapon = nil
 local KillCount = 0
 local SessionStartTime = tick()
 local pimpleHUB, Notifier, Window, ConfigManager
-local AutoSwingToggle, AutoGunToggle, AutoTeleportToggle = nil, nil, nil
+local AutoSwingToggle, AutoGunToggle, AutoTeleportToggle, SmartCooldownToggle, EnemyESPToggle, AutoSummonToggle = nil, nil, nil, nil, nil, nil
 local UIOpen = true
 
--- ==================== ITEM TRACKER DATA ====================
 local MAX_ITEMS = 50
 local ItemLog = {}
 local ItemLogMap = {}
@@ -47,12 +50,13 @@ local MAX_PROCESSED = 200
 
 local Connections = {}
 local ClockRunning = true
+local WeaponCooldownCache = {}
+local ESPObjects = {}
+local ESPTimer = 0
 
 local function CleanupConnections()
     for _, conn in ipairs(Connections) do
-        if conn and typeof(conn) == "RBXScriptConnection" and conn.Connected then
-            conn:Disconnect()
-        end
+        if conn and typeof(conn) == "RBXScriptConnection" and conn.Connected then conn:Disconnect() end
     end
     table.clear(Connections)
 end
@@ -110,12 +114,289 @@ local function GetEquippedTool()
     return nil
 end
 
--- ==================== WEAPON SYSTEM ====================
--- SWORD pattern: tool.RemoteFunction:InvokeServer("hit", {80, 1})
--- GUN patterns (all confirmed from intercepts):
---   AUG:                tool.RemoteEvent:FireServer("hit", {["mhit"] = Vector3})
---   Old Construct Rifle: tool.RemoteEvent:FireServer("hit", {["mhit"] = Vector3})
---   Inglaciator:         tool.RemoteFunction:InvokeServer("shoot", {CFrame, 8})
+local function IsCraftwarsAlly(obj)
+    if not obj or not obj:IsA("Model") then return false end
+    if obj:FindFirstChild("AlliedSummon") then return true end
+    if obj:FindFirstChild("SummonMain") and obj:FindFirstChild("OwnerTag") then return true end
+    if obj:FindFirstChild("SummonLife") and obj:FindFirstChild("SummonPower") then return true end
+    if obj:FindFirstChild("nopvp") and obj:FindFirstChild("SummonTime") then return true end
+    return false
+end
+
+local function IsSummonOwnedByPlayer(obj, player)
+    if not obj then return false end
+    local ownerTag = obj:FindFirstChild("OwnerTag")
+    if ownerTag then
+        if ownerTag:IsA("ObjectValue") and ownerTag.Value == player then return true end
+        if ownerTag:IsA("StringValue") then
+            if ownerTag.Value == player.Name or ownerTag.Value == tostring(player.UserId) then return true end
+        end
+    end
+    local owner = obj:FindFirstChild("Owner") or obj:FindFirstChild("Summoner") or obj:FindFirstChild("Creator")
+    if owner then
+        if owner:IsA("ObjectValue") and owner.Value == player then return true end
+        if owner:IsA("StringValue") then
+            if owner.Value == player.Name or owner.Value == tostring(player.UserId) then return true end
+        end
+        if owner:IsA("IntValue") and owner.Value == player.UserId then return true end
+    end
+    return false
+end
+
+local function IsAnySummon(obj)
+    if not obj or not obj:IsA("Model") then return false end
+    if IsCraftwarsAlly(obj) then return true end
+    local ownerVal = obj:FindFirstChild("Owner") or obj:FindFirstChild("Summoner") or obj:FindFirstChild("Creator")
+        or obj:FindFirstChild("OwnerTag") or obj:FindFirstChild("SummonedBy")
+    if ownerVal then
+        if ownerVal:IsA("ObjectValue") and ownerVal.Value and ownerVal.Value:IsA("Player") then return true end
+        if ownerVal:IsA("StringValue") then
+            for _, p in ipairs(Players:GetPlayers()) do
+                if ownerVal.Value == p.Name or ownerVal.Value == tostring(p.UserId) then return true end
+            end
+        end
+    end
+    local nameLower = obj.Name:lower()
+    if nameLower:find("summon", 1, true) or nameLower:find("minion", 1, true) or nameLower:find("ally", 1, true) then
+        return true
+    end
+    local parent = obj.Parent
+    if parent then
+        local parentName = parent.Name:lower()
+        if parentName:find("summon", 1, true) or parentName:find("minion", 1, true) then return true end
+        for _, p in ipairs(Players:GetPlayers()) do
+            if parent.Name == p.Name then return true end
+        end
+    end
+    return false
+end
+
+local function IsMySummon(obj)
+    if not obj or not obj:IsA("Model") then return false end
+    if IsCraftwarsAlly(obj) and IsSummonOwnedByPlayer(obj, LocalPlayer) then return true end
+    if IsCraftwarsAlly(obj) then
+        local objPart = obj:FindFirstChild("HumanoidRootPart") or obj:FindFirstChild("Head")
+        local char = LocalPlayer.Character
+        if objPart and char then
+            local hrp = char:FindFirstChild("HumanoidRootPart")
+            if hrp and (hrp.Position - objPart.Position).Magnitude < 40 then
+                local closestPlayer, closestDist = nil, math.huge
+                for _, p in ipairs(Players:GetPlayers()) do
+                    if p.Character then
+                        local pHRP = p.Character:FindFirstChild("HumanoidRootPart")
+                        if pHRP then
+                            local d = (pHRP.Position - objPart.Position).Magnitude
+                            if d < closestDist then closestDist = d closestPlayer = p end
+                        end
+                    end
+                end
+                if closestPlayer == LocalPlayer then return true end
+            end
+        end
+    end
+    return false
+end
+
+local function IsSummonerTool(tool)
+    if not tool or not tool:IsA("Tool") then return false end
+    if tool:FindFirstChild("AlliedSummon") then return true end
+    if tool:FindFirstChild("SummonMain") then return true end
+    if tool:FindFirstChild("SummonLife") then return true end
+    if tool:FindFirstChild("SummonPower") then return true end
+    if tool:FindFirstChild("SummonTime") then return true end
+    local nameLower = tool.Name:lower()
+    if nameLower:find("summon", 1, true) or nameLower:find("summoner", 1, true) then return true end
+    return false
+end
+
+local function GetSummonerFromBackpack()
+    local backpack = LocalPlayer:FindFirstChild("Backpack")
+    if backpack then
+        for _, item in ipairs(backpack:GetChildren()) do
+            if item:IsA("Tool") and IsSummonerTool(item) then return item end
+        end
+    end
+    local char = LocalPlayer.Character
+    if char then
+        for _, item in ipairs(char:GetChildren()) do
+            if item:IsA("Tool") and IsSummonerTool(item) then return item end
+        end
+    end
+    return nil
+end
+
+local function CountMySummons()
+    local count = 0
+    local function Scan(container)
+        for _, obj in ipairs(container:GetChildren()) do
+            if obj:IsA("Model") and IsCraftwarsAlly(obj) and IsMySummon(obj) then
+                local hum = obj:FindFirstChildOfClass("Humanoid")
+                if hum and hum.Health > 0 then count = count + 1 end
+            end
+        end
+    end
+    Scan(workspace)
+    local folders = {"Summons", "Minions", "Allies", "Enemies", "NPCs", "Mobs"}
+    for _, name in ipairs(folders) do
+        local folder = workspace:FindFirstChild(name)
+        if folder then Scan(folder) end
+    end
+    local playerFolder = workspace:FindFirstChild(LocalPlayer.Name)
+    if playerFolder then Scan(playerFolder) end
+    return count
+end
+
+local function EquipWeaponByName(weaponName)
+    if not weaponName then return false end
+    local backpack = LocalPlayer:FindFirstChild("Backpack")
+    if not backpack then return false end
+    local weapon = backpack:FindFirstChild(weaponName)
+    if weapon and weapon:IsA("Tool") then
+        local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+        if hum then hum:EquipTool(weapon) return true end
+    end
+    return false
+end
+
+local function ActivateSummonerTool(tool)
+    if not tool then return end
+    local char = LocalPlayer.Character
+    if not char then return end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if not hum then return end
+
+    local currentTool = GetEquippedTool()
+    local previousWeapon = nil
+    if currentTool and currentTool ~= tool and not IsSummonerTool(currentTool) then
+        previousWeapon = currentTool.Name
+    end
+
+    if currentTool ~= tool then
+        hum:EquipTool(tool)
+        task.wait(0.15)
+    end
+
+    pcall(function() tool:Activate() end)
+
+    local rf = tool:FindFirstChild("RemoteFunction")
+    if rf then
+        pcall(function() rf:InvokeServer("hit", {80, 1}) end)
+    end
+
+    local re = tool:FindFirstChild("RemoteEvent")
+    if re then
+        pcall(function() re:FireServer("hit", {80, 1}) end)
+    end
+
+    if previousWeapon then
+        task.delay(0.3, function()
+            EquipWeaponByName(previousWeapon)
+        end)
+    elseif LastEquippedWeapon and not IsSummonerTool(tool) == false then
+        task.delay(0.3, function()
+            EquipWeaponByName(LastEquippedWeapon)
+        end)
+    end
+end
+
+local function TryAutoSummon()
+    if not Flags.AutoSummon then return end
+    if not (Flags.AutoSwing or Flags.AutoGun) then return end
+
+    local summoner = GetSummonerFromBackpack()
+    if not summoner then return end
+
+    local currentCount = CountMySummons()
+    if currentCount >= 3 then return end
+
+    ActivateSummonerTool(summoner)
+end
+
+local function ClassifyWeapon(tool)
+    if not tool then return "unknown", Flags.GunCooldown end
+    if WeaponCooldownCache[tool.Name] then
+        return WeaponCooldownCache[tool.Name].class, WeaponCooldownCache[tool.Name].cd
+    end
+
+    local hasRE = tool:FindFirstChild("RemoteEvent") ~= nil
+    local hasRF = tool:FindFirstChild("RemoteFunction") ~= nil
+
+    local fireRateVal = tool:FindFirstChild("FireRate")
+        or tool:FindFirstChild("ShootCooldown")
+        or tool:FindFirstChild("Cooldown")
+        or tool:FindFirstChild("AttackSpeed")
+        or tool:FindFirstChild("FireDelay")
+        or tool:FindFirstChild("ShootSpeed")
+        or tool:FindFirstChild("RateOfFire")
+
+    if fireRateVal and fireRateVal:IsA("ValueBase") then
+        local val = tonumber(fireRateVal.Value)
+        if val and val > 0 then
+            if val > 2 then val = 1 / val end
+            val = math.max(val, 0.10)
+            local class = val <= 0.15 and "fast_blaster" or (val <= 0.25 and "standard_gun" or "cannon")
+            WeaponCooldownCache[tool.Name] = {class = class, cd = val}
+            return class, val
+        end
+    end
+
+    local isProjectileGun = tool:FindFirstChild("GunThrowerMain") ~= nil
+        or tool:FindFirstChild("RangedSpread") ~= nil
+        or tool:FindFirstChild("RangedPower") ~= nil
+        or tool:FindFirstChild("RangedProjectileAmount") ~= nil
+        or tool:FindFirstChild("ProjectileSpeed") ~= nil
+        or tool:FindFirstChild("Cannonball") ~= nil
+        or tool:FindFirstChild("Explosion") ~= nil
+        or tool:FindFirstChild("ExplosionDamage") ~= nil
+        or tool:FindFirstChild("BlastRadius") ~= nil
+
+    local isFastBlaster = tool:FindFirstChild("AutoFire") ~= nil
+        or tool:FindFirstChild("RapidFire") ~= nil
+        or tool:FindFirstChild("BurstFire") ~= nil
+        or tool:FindFirstChild("Automatic") ~= nil
+        or tool:FindFirstChild("FullAuto") ~= nil
+
+    local nameLower = tool.Name:lower()
+    local fastKeywords = {"blaster", "smg", "uzi", "minigun", "auto", "rapid", "laser", "beam", "pulse", "plasma"}
+    local cannonKeywords = {"cannon", "launcher", "mortar", "rocket", "breath", "hydra", "bomb", "grenade", "catapult", "ballista"}
+
+    if not isFastBlaster then
+        for _, kw in ipairs(fastKeywords) do
+            if nameLower:find(kw, 1, true) then isFastBlaster = true break end
+        end
+    end
+    if not isProjectileGun then
+        for _, kw in ipairs(cannonKeywords) do
+            if nameLower:find(kw, 1, true) then isProjectileGun = true break end
+        end
+    end
+
+    local class, cd
+    if isFastBlaster then
+        class, cd = "fast_blaster", 0.10
+    elseif isProjectileGun then
+        class, cd = "cannon", 0.30
+    elseif hasRE and not hasRF then
+        class, cd = "standard_gun", 0.18
+    elseif hasRF and not hasRE then
+        class, cd = "cannon", 0.30
+    elseif hasRE and hasRF then
+        class, cd = "standard_gun", 0.18
+    else
+        class, cd = "unknown", Flags.GunCooldown
+    end
+
+    WeaponCooldownCache[tool.Name] = {class = class, cd = cd}
+    return class, cd
+end
+
+local function GetEffectiveGunCooldown()
+    if not Flags.SmartGunCooldown then return Flags.GunCooldown end
+    local tool = GetEquippedTool()
+    if not tool then return Flags.GunCooldown end
+    local _, cd = ClassifyWeapon(tool)
+    return cd
+end
 
 local function GetWeaponStats()
     local weapon = GetEquippedTool()
@@ -129,31 +410,28 @@ local function GetWeaponStats()
     if critDamage then stats.CritDamage = critDamage.Value end
     if critChance then stats.CritChance = critChance.Value end
     if speed then stats.Speed = speed.Value end
+    local class, cd = ClassifyWeapon(weapon)
+    stats.WeaponClass = class
+    stats.EffectiveCooldown = cd
+    stats.IsSummoner = IsSummonerTool(weapon)
     return stats
 end
 
-local function EquipWeaponByName(weaponName)
-    if not weaponName then return false end
-    local backpack = LocalPlayer:FindFirstChild("Backpack")
-    if not backpack then return false end
-    local weapon = backpack:FindFirstChild(weaponName)
-    if weapon and weapon:IsA("Tool") then
-        local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
-        if hum then
-            hum:EquipTool(weapon)
-            return true
-        end
+local function IsPlayerCharacter(obj)
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p.Character == obj then return true end
     end
     return false
 end
 
 local function IsValidEnemy(obj)
     if not obj or not obj:IsA("Model") then return false end
-    for _, p in ipairs(Players:GetPlayers()) do
-        if p.Character == obj then return false end
-    end
+    if IsPlayerCharacter(obj) then return false end
     local hum = obj:FindFirstChildOfClass("Humanoid")
-    return hum and hum.Health > 0
+    if not hum or hum.Health <= 0 then return false end
+    if IsCraftwarsAlly(obj) then return false end
+    if IsAnySummon(obj) then return false end
+    return true
 end
 
 local function GetAllEnemies()
@@ -171,6 +449,33 @@ local function GetAllEnemies()
         end
     end
     return enemies
+end
+
+local function GetAllSummons()
+    local summons = {}
+    local seen = {}
+    local function Scan(container)
+        for _, obj in ipairs(container:GetChildren()) do
+            if not seen[obj] and obj:IsA("Model") and not IsPlayerCharacter(obj) then
+                local hum = obj:FindFirstChildOfClass("Humanoid")
+                if hum and hum.Health > 0 and (IsCraftwarsAlly(obj) or IsAnySummon(obj)) then
+                    seen[obj] = true
+                    table.insert(summons, obj)
+                end
+            end
+        end
+    end
+    Scan(workspace)
+    local folders = {"Summons", "Minions", "Pets", "Allies", "Enemies", "NPCs", "Mobs"}
+    for _, name in ipairs(folders) do
+        local folder = workspace:FindFirstChild(name)
+        if folder then Scan(folder) end
+    end
+    for _, p in ipairs(Players:GetPlayers()) do
+        local folder = workspace:FindFirstChild(p.Name)
+        if folder then Scan(folder) end
+    end
+    return summons
 end
 
 local function GetEnemyHP(enemy)
@@ -243,7 +548,11 @@ end
 local function GetCurrentTarget()
     if CurrentTarget then
         local hum = CurrentTarget:FindFirstChildOfClass("Humanoid")
-        if hum and hum.Health > 0 and CurrentTarget.Parent then return CurrentTarget end
+        if hum and hum.Health > 0 and CurrentTarget.Parent then
+            if not IsCraftwarsAlly(CurrentTarget) and not IsAnySummon(CurrentTarget) then
+                return CurrentTarget
+            end
+        end
         KillCount = KillCount + 1
         CurrentTarget = nil
     end
@@ -294,12 +603,10 @@ local function TeleportToTarget()
     hrp.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
 end
 
--- ==================== ATTACK FUNCTIONS ====================
-
--- AUTO SWING: Calls RemoteFunction with "hit" — melee/sword pattern
 local function PerformSwordAttack()
     local tool = GetEquippedTool()
     if not tool then return end
+    if IsSummonerTool(tool) then return end
     local rf = tool:FindFirstChild("RemoteFunction")
     if not rf then return end
     if not GetCurrentTarget() then return end
@@ -307,66 +614,159 @@ local function PerformSwordAttack()
     pcall(function() rf:InvokeServer("hit", {80, 1}) end)
 end
 
--- AUTO GUN: Fires at the target using ALL known gun patterns.
--- Type 1 (AUG, Old Construct Rifle): RemoteEvent:FireServer("hit", {["mhit"] = Vector3})
--- Type 2 (Inglaciator): RemoteFunction:InvokeServer("shoot", {CFrame, damage})
--- We detect which type and fire accordingly. We also try both as fallback.
+local function GetToolFirePoint(tool)
+    if not tool then return nil end
+    local barrel = tool:FindFirstChild("Barrel") or tool:FindFirstChild("Muzzle") or tool:FindFirstChild("FirePoint") or tool:FindFirstChild("ShootPart")
+    if barrel and barrel:IsA("BasePart") then return barrel end
+    local handle = tool:FindFirstChild("Handle")
+    if handle and handle:IsA("BasePart") then return handle end
+    return nil
+end
+
 local function PerformGunAttack()
     local tool = GetEquippedTool()
     if not tool then return end
-
+    if IsSummonerTool(tool) then return end
     local target = GetCurrentTarget()
     if not target then return end
     local targetPos = GetEnemyPosition(target)
     if not targetPos then return end
-
     LastEquippedWeapon = tool.Name
-
     local char = LocalPlayer.Character
     if not char then return end
     local hrp = char:FindFirstChild("HumanoidRootPart")
     if not hrp then return end
-
     local re = tool:FindFirstChild("RemoteEvent")
     local rf = tool:FindFirstChild("RemoteFunction")
-
-    -- Get the tool's Damage value if available
     local dmgVal = tool:FindFirstChild("Damage")
-    local dmg = dmgVal and dmgVal.Value or 8
+    local dmg = dmgVal and dmgVal.Value or 20
 
-    -- Detect if this is a "thrower" / projectile gun (Inglaciator type)
-    local isShootGun = tool:FindFirstChild("GunThrowerMain") ~= nil
-        or tool:FindFirstChild("RangedSpread") ~= nil
-        or tool:FindFirstChild("RangedPower") ~= nil
-        or tool:FindFirstChild("RangedProjectileAmount") ~= nil
+    local enemyHRP = GetEnemyHRP(target)
+    if enemyHRP then targetPos = enemyHRP.Position end
 
-    -- Build aim CFrame: from player position looking at enemy
-    local aimCF = CFrame.lookAt(hrp.Position, targetPos)
+    local firePoint = GetToolFirePoint(tool)
+    local firePos = firePoint and firePoint.Position or hrp.Position
+    local aimCF = CFrame.lookAt(firePos, targetPos)
 
-    -- TYPE 1: RemoteEvent guns (AUG, Old Construct Rifle, etc.)
-    -- Pattern: RE:FireServer("hit", {["mhit"] = Vector3})
     if re then
         pcall(function() re:FireServer("hit", {["mhit"] = targetPos}) end)
     end
-
-    -- TYPE 2: RemoteFunction "shoot" guns (Inglaciator, etc.)
-    -- Pattern: RF:InvokeServer("shoot", {CFrame, damage})
-    if rf and (isShootGun or not re) then
+    if rf then
         pcall(function() rf:InvokeServer("shoot", {aimCF, dmg}) end)
-    end
-
-    -- FALLBACK: If the gun has BOTH RE and RF but we're not sure which pattern,
-    -- try the "shoot" on RF as well (won't hurt — pcall protects us)
-    if rf and re and not isShootGun then
-        pcall(function() rf:InvokeServer("shoot", {aimCF, dmg}) end)
+        pcall(function() rf:InvokeServer("shoot", aimCF, dmg) end)
     end
 end
 
 local function GetSessionTime()
     local elapsed = tick() - SessionStartTime
-    local mins = math.floor(elapsed / 60)
-    local secs = math.floor(elapsed % 60)
-    return string.format("%02d:%02d", mins, secs)
+    return string.format("%02d:%02d", math.floor(elapsed / 60), math.floor(elapsed % 60))
+end
+
+local function ClearESP()
+    for enemy, obj in pairs(ESPObjects) do
+        pcall(function() obj:Destroy() end)
+        pcall(function()
+            local hl = enemy and enemy:FindFirstChild("PimpleHL")
+            if hl then hl:Destroy() end
+        end)
+    end
+    ESPObjects = {}
+end
+
+local function CreateESP(model, espType)
+    if not model then return end
+    if ESPObjects[model] then return end
+    local hrp = model:FindFirstChild("HumanoidRootPart") or model:FindFirstChild("Head")
+    if not hrp then return end
+
+    local isBoss = espType == "enemy" and IsBoss(model)
+    local nameColor, hpColor, fillColor, outlineColor
+    if espType == "summon" then
+        nameColor = Color3.fromRGB(100, 255, 100)
+        hpColor = Color3.fromRGB(150, 255, 150)
+        fillColor = Color3.fromRGB(0, 200, 0)
+        outlineColor = Color3.fromRGB(100, 255, 100)
+    elseif isBoss then
+        nameColor = Color3.fromRGB(255, 50, 50)
+        hpColor = Color3.fromRGB(255, 150, 150)
+        fillColor = Color3.fromRGB(255, 0, 0)
+        outlineColor = Color3.fromRGB(255, 50, 50)
+    else
+        nameColor = Color3.fromRGB(255, 80, 80)
+        hpColor = Color3.fromRGB(255, 150, 100)
+        fillColor = Color3.fromRGB(200, 0, 0)
+        outlineColor = Color3.fromRGB(255, 80, 80)
+    end
+
+    local billboard = Instance.new("BillboardGui")
+    billboard.Name = "PimpleESP"
+    billboard.Adornee = hrp
+    billboard.Size = UDim2.new(0, 200, 0, 50)
+    billboard.StudsOffset = Vector3.new(0, 3, 0)
+    billboard.AlwaysOnTop = true
+    billboard.Parent = game:GetService("CoreGui")
+
+    local prefix = espType == "summon" and "[ALLY] " or (isBoss and "[BOSS] " or "")
+
+    local nameLabel = Instance.new("TextLabel")
+    nameLabel.Size = UDim2.new(1, 0, 0.5, 0)
+    nameLabel.BackgroundTransparency = 1
+    nameLabel.TextColor3 = nameColor
+    nameLabel.TextStrokeTransparency = 0
+    nameLabel.TextStrokeColor3 = Color3.new(0, 0, 0)
+    nameLabel.Font = Enum.Font.GothamBold
+    nameLabel.TextSize = 14
+    nameLabel.Text = prefix .. model.Name
+    nameLabel.Parent = billboard
+
+    local hpLabel = Instance.new("TextLabel")
+    hpLabel.Size = UDim2.new(1, 0, 0.5, 0)
+    hpLabel.Position = UDim2.new(0, 0, 0.5, 0)
+    hpLabel.BackgroundTransparency = 1
+    hpLabel.TextColor3 = hpColor
+    hpLabel.TextStrokeTransparency = 0
+    hpLabel.TextStrokeColor3 = Color3.new(0, 0, 0)
+    hpLabel.Font = Enum.Font.Gotham
+    hpLabel.TextSize = 12
+    hpLabel.Parent = billboard
+
+    local highlight = Instance.new("Highlight")
+    highlight.Name = "PimpleHL"
+    highlight.FillColor = fillColor
+    highlight.FillTransparency = 0.7
+    highlight.OutlineColor = outlineColor
+    highlight.OutlineTransparency = 0.3
+    highlight.Parent = model
+
+    ESPObjects[model] = billboard
+
+    task.spawn(function()
+        while model and model.Parent and Flags.EnemyESP do
+            local hum = model:FindFirstChildOfClass("Humanoid")
+            if hum then
+                hpLabel.Text = math.floor(hum.Health) .. "/" .. math.floor(hum.MaxHealth)
+            end
+            task.wait(0.5)
+        end
+        pcall(function() billboard:Destroy() end)
+        pcall(function()
+            local hl = model and model:FindFirstChild("PimpleHL")
+            if hl then hl:Destroy() end
+        end)
+        ESPObjects[model] = nil
+    end)
+end
+
+local function UpdateESP()
+    if not Flags.EnemyESP then ClearESP() return end
+    local enemies = GetAllEnemies()
+    for _, enemy in ipairs(enemies) do
+        CreateESP(enemy, "enemy")
+    end
+    local summons = GetAllSummons()
+    for _, summon in ipairs(summons) do
+        CreateESP(summon, "summon")
+    end
 end
 
 local function OnCharacterAdded(char)
@@ -375,22 +775,17 @@ local function OnCharacterAdded(char)
     hum.WalkSpeed = Flags.WalkSpeed
     hum.JumpPower = Flags.JumpPower
     task.delay(0.5, function()
-        if hum and hum.Parent then
-            hum.WalkSpeed = Flags.WalkSpeed
-            hum.JumpPower = Flags.JumpPower
-        end
+        if hum and hum.Parent then hum.WalkSpeed = Flags.WalkSpeed hum.JumpPower = Flags.JumpPower end
     end)
     task.delay(1, function()
-        if hum and hum.Parent then
-            hum.WalkSpeed = Flags.WalkSpeed
-            hum.JumpPower = Flags.JumpPower
-        end
+        if hum and hum.Parent then hum.WalkSpeed = Flags.WalkSpeed hum.JumpPower = Flags.JumpPower end
     end)
     if Flags.AutoReequip and LastEquippedWeapon then
         task.delay(0.5, function() EquipWeaponByName(LastEquippedWeapon) end)
         task.delay(1.5, function() EquipWeaponByName(LastEquippedWeapon) end)
     end
     CurrentTarget = nil
+    WeaponCooldownCache = {}
 end
 
 local function OnCharacterRemoving(char)
@@ -401,9 +796,6 @@ end
 if LocalPlayer.Character then task.spawn(function() OnCharacterAdded(LocalPlayer.Character) end) end
 AddConnection(LocalPlayer.CharacterAdded:Connect(OnCharacterAdded))
 AddConnection(LocalPlayer.CharacterRemoving:Connect(OnCharacterRemoving))
-
--- ==================== ITEM TRACKER SYSTEM ====================
--- ONLY tracks items from chat messages. Does NOT track backpack equip/unequip.
 
 local function FormatTimeAgo(timestamp)
     local elapsed = tick() - timestamp
@@ -417,9 +809,7 @@ local function GetFilteredItems()
     local filtered = {}
     local query = ItemSearchQuery:lower()
     for _, entry in ipairs(ItemLog) do
-        if entry.name:lower():find(query, 1, true) then
-            table.insert(filtered, entry)
-        end
+        if entry.name:lower():find(query, 1, true) then table.insert(filtered, entry) end
     end
     return filtered
 end
@@ -427,18 +817,11 @@ end
 local function BuildItemListText()
     local items = GetFilteredItems()
     if #items == 0 then
-        if ItemSearchQuery ~= "" then
-            return 'No items matching "' .. ItemSearchQuery .. '"'
-        end
+        if ItemSearchQuery ~= "" then return 'No items matching "' .. ItemSearchQuery .. '"' end
         return "Waiting for drops..."
     end
-
     local lines = {}
-    for _, entry in ipairs(items) do
-        local line = "x" .. entry.totalQty .. "  " .. entry.name
-        table.insert(lines, line)
-    end
-
+    for _, entry in ipairs(items) do table.insert(lines, "x" .. entry.totalQty .. "  " .. entry.name) end
     return table.concat(lines, "\n")
 end
 
@@ -447,70 +830,47 @@ local function BuildCountTitle()
 end
 
 function RefreshItemList()
-    -- Update the count paragraph title
     if ItemCountParagraph then
-        pcall(function()
-            if ItemCountParagraph.SetTitle then
-                ItemCountParagraph:SetTitle(BuildCountTitle())
-            end
-        end)
+        pcall(function() if ItemCountParagraph.SetTitle then ItemCountParagraph:SetTitle(BuildCountTitle()) end end)
     end
-    -- Update the item list paragraph content
     if ItemListParagraph then
         pcall(function()
             local text = BuildItemListText()
-            if ItemListParagraph.SetContent then
-                ItemListParagraph:SetContent(text)
-            elseif ItemListParagraph.Set then
-                ItemListParagraph:Set(text)
-            elseif ItemListParagraph.SetText then
-                ItemListParagraph:SetText(text)
-            end
+            if ItemListParagraph.SetContent then ItemListParagraph:SetContent(text)
+            elseif ItemListParagraph.Set then ItemListParagraph:Set(text)
+            elseif ItemListParagraph.SetText then ItemListParagraph:SetText(text) end
         end)
     end
 end
 
 local function CleanMessage(text)
     if not text then return "" end
-    local clean = text:gsub("<.->", "")
-    clean = clean:gsub("^%s+", ""):gsub("%s+$", "")
-    return clean
+    return text:gsub("<.->", ""):gsub("^%s+", ""):gsub("%s+$", "")
 end
 
 local function ParseItemMessage(raw)
     local message = CleanMessage(raw)
     if message == "" then return nil, nil end
-
     local qty, itemName = message:match("You got (%d+) (.+)!")
     if qty and itemName then return itemName, tonumber(qty) end
-
     itemName = message:match("You got (.+)!")
     if itemName then return itemName, 1 end
-
     qty, itemName = message:match("You received (%d+) (.+)")
     if qty and itemName then return itemName:gsub("!$", ""), tonumber(qty) end
-
     itemName = message:match("You received (.+)")
     if itemName then return itemName:gsub("!$", ""), 1 end
-
     itemName, qty = message:match("Obtained: (.+) %(x(%d+)%)")
     if itemName and qty then return itemName, tonumber(qty) end
-
     itemName = message:match("Obtained: (.+)")
     if itemName then return itemName:gsub("!$", ""), 1 end
-
     qty, itemName = message:match("^%+(%d+)%s+(.+)")
     if qty and itemName then return itemName:gsub("!$", ""), tonumber(qty) end
-
     itemName = message:match("Dropped: (.+)")
     if itemName then return itemName:gsub("!$", ""), 1 end
-
     itemName, qty = message:match("%[Item%]%s*(.+)%s+x(%d+)")
     if itemName and qty then return itemName, tonumber(qty) end
-
     itemName = message:match("%[Item%]%s*(.+)")
     if itemName then return itemName:gsub("!$", ""), 1 end
-
     return nil, nil
 end
 
@@ -522,30 +882,17 @@ local function RegisterItem(itemName, quantity)
     if not itemName or itemName == "" then return end
     quantity = quantity or 1
     TotalItemsCollected = TotalItemsCollected + quantity
-
     if ItemLogMap[itemName] then
         local idx = ItemLogMap[itemName]
         ItemLog[idx].totalQty = ItemLog[idx].totalQty + quantity
         ItemLog[idx].lastTime = tick()
         ItemLog[idx].drops = ItemLog[idx].drops + 1
     else
-        table.insert(ItemLog, 1, {
-            name = itemName,
-            totalQty = quantity,
-            lastTime = tick(),
-            drops = 1,
-        })
-
-        while #ItemLog > MAX_ITEMS do
-            table.remove(ItemLog, #ItemLog)
-        end
-
+        table.insert(ItemLog, 1, {name = itemName, totalQty = quantity, lastTime = tick(), drops = 1})
+        while #ItemLog > MAX_ITEMS do table.remove(ItemLog, #ItemLog) end
         ItemLogMap = {}
-        for i, e in ipairs(ItemLog) do
-            ItemLogMap[e.name] = i
-        end
+        for i, e in ipairs(ItemLog) do ItemLogMap[e.name] = i end
     end
-
     RefreshItemList()
 end
 
@@ -553,35 +900,22 @@ local function OnItemMessage(rawText)
     if not rawText or rawText == "" then return end
     local clean = CleanMessage(rawText)
     if clean == "" then return end
-
     local key = MakeDedup(clean)
     if ProcessedMessages[key] then return end
     ProcessedMessages[key] = true
-
     local count = 0
     for _ in pairs(ProcessedMessages) do count = count + 1 end
-    if count > MAX_PROCESSED then
-        ProcessedMessages = {}
-    end
-
+    if count > MAX_PROCESSED then ProcessedMessages = {} end
     local itemName, qty = ParseItemMessage(clean)
-    if itemName then
-        RegisterItem(itemName, qty)
-    end
+    if itemName then RegisterItem(itemName, qty) end
 end
 
 local function MightBeItemDrop(text)
     if not text or text == "" then return false end
     local lower = text:lower()
-    return lower:find("you got")
-        or lower:find("you received")
-        or lower:find("obtained")
-        or lower:find("%+%d+%s+%a")
-        or lower:find("dropped:")
-        or lower:find("%[item%]")
+    return lower:find("you got") or lower:find("you received") or lower:find("obtained")
+        or lower:find("%+%d+%s+%a") or lower:find("dropped:") or lower:find("%[item%]")
 end
-
--- ==================== CHAT LISTENER (CHAT ONLY — NO BACKPACK) ====================
 
 local function SetupChatListener()
     pcall(function()
@@ -594,7 +928,6 @@ local function SetupChatListener()
             end))
         end
     end)
-
     pcall(function()
         if TextChatService then
             local function HookChannel(channel)
@@ -609,20 +942,13 @@ local function SetupChatListener()
                     end)
                 end
             end
-            for _, channel in ipairs(TextChatService:GetDescendants()) do
-                HookChannel(channel)
-            end
-            AddConnection(TextChatService.DescendantAdded:Connect(function(desc)
-                task.wait(0.1)
-                HookChannel(desc)
-            end))
+            for _, channel in ipairs(TextChatService:GetDescendants()) do HookChannel(channel) end
+            AddConnection(TextChatService.DescendantAdded:Connect(function(desc) task.wait(0.1) HookChannel(desc) end))
         end
     end)
-
     pcall(function()
         local pg = LocalPlayer:WaitForChild("PlayerGui", 5)
         if not pg then return end
-
         local function WatchLabel(label)
             if not (label:IsA("TextLabel") or label:IsA("TextButton")) then return end
             local text = label.Text or ""
@@ -634,24 +960,13 @@ local function SetupChatListener()
                 end))
             end)
         end
-
         local chatFrame = pg:FindFirstChild("Chat")
         if chatFrame then
-            for _, desc in ipairs(chatFrame:GetDescendants()) do
-                pcall(function() WatchLabel(desc) end)
-            end
-            AddConnection(chatFrame.DescendantAdded:Connect(function(desc)
-                task.wait(0.05)
-                pcall(function() WatchLabel(desc) end)
-            end))
+            for _, desc in ipairs(chatFrame:GetDescendants()) do pcall(function() WatchLabel(desc) end) end
+            AddConnection(chatFrame.DescendantAdded:Connect(function(desc) task.wait(0.05) pcall(function() WatchLabel(desc) end) end))
         end
-
-        AddConnection(pg.DescendantAdded:Connect(function(desc)
-            task.wait(0.05)
-            pcall(function() WatchLabel(desc) end)
-        end))
+        AddConnection(pg.DescendantAdded:Connect(function(desc) task.wait(0.05) pcall(function() WatchLabel(desc) end) end))
     end)
-
     pcall(function()
         local StarterGui = game:GetService("StarterGui")
         local signal = StarterGui:GetCore("ChatWindowMessageSignal")
@@ -659,19 +974,14 @@ local function SetupChatListener()
             AddConnection(signal:Connect(function(messageData)
                 pcall(function()
                     local text = ""
-                    if type(messageData) == "string" then
-                        text = messageData
-                    elseif type(messageData) == "table" then
-                        text = messageData.Message or messageData.Text or messageData.message or ""
-                    end
+                    if type(messageData) == "string" then text = messageData
+                    elseif type(messageData) == "table" then text = messageData.Message or messageData.Text or messageData.message or "" end
                     if MightBeItemDrop(text) then OnItemMessage(text) end
                 end)
             end))
         end
     end)
 end
-
--- ==================== UI SETUP ====================
 
 pimpleHUB = loadstring(game:HttpGet("https://raw.githubusercontent.com/4lpaca-pin/CompKiller/refs/heads/main/src/source.luau"))()
 Notifier = pimpleHUB.newNotify()
@@ -694,7 +1004,7 @@ Window.OnToggle = function(visible) UIOpen = visible end
 
 Notifier.new({
     Title = "pimpleHUB Loaded",
-    Content = "Left Alt = UI\nV = Swing | B = Gun | N = Teleport",
+    Content = "Left Alt = UI | V = Swing | B = Gun\nN = Teleport",
     Duration = 5,
     Icon = AVATAR_ICON
 })
@@ -711,41 +1021,41 @@ task.spawn(function()
 end)
 Watermark:AddText({Icon = "server", Text = pimpleHUB.Version})
 
--- ==================== COMBAT TAB ====================
 Window:DrawCategory({Name = "COMBAT"})
 local CombatTab = Window:DrawTab({Name = "Combat", Icon = "sword", EnableScrolling = true})
-
 local KillAuraSection = CombatTab:DrawSection({Name = "Kill Aura", Position = "left"})
 
 AutoSwingToggle = KillAuraSection:AddToggle({
-    Name = "Auto Swing",
-    Flag = "AutoSwing",
-    Default = false,
+    Name = "Auto Swing", Flag = "AutoSwing", Default = false,
     Callback = function(v) Flags.AutoSwing = v end
 })
-AutoSwingToggle.Link:AddKeybind({
-    Default = "V",
-    Flag = "SwingKeybind",
-    Callback = ToggleAutoSwing
-})
+AutoSwingToggle.Link:AddKeybind({Default = "V", Flag = "SwingKeybind", Callback = ToggleAutoSwing})
 AutoSwingToggle.Link:AddHelper({Text = "Melee: RF 'hit'"})
 
 AutoGunToggle = KillAuraSection:AddToggle({
-    Name = "Auto Gun",
-    Flag = "AutoGun",
-    Default = false,
+    Name = "Auto Gun", Flag = "AutoGun", Default = false,
     Callback = function(v) Flags.AutoGun = v end
 })
-AutoGunToggle.Link:AddKeybind({
-    Default = "B",
-    Flag = "GunKeybind",
-    Callback = ToggleAutoGun
+AutoGunToggle.Link:AddKeybind({Default = "B", Flag = "GunKeybind", Callback = ToggleAutoGun})
+AutoGunToggle.Link:AddHelper({Text = "All guns: RE + RF"})
+
+AutoSummonToggle = KillAuraSection:AddToggle({
+    Name = "Auto Summon", Flag = "AutoSummon", Default = false,
+    Callback = function(v) Flags.AutoSummon = v end
 })
-AutoGunToggle.Link:AddHelper({Text = "Ranged: all gun types"})
+AutoSummonToggle.Link:AddHelper({Text = "Uses summon items auto"})
+
+EnemyESPToggle = KillAuraSection:AddToggle({
+    Name = "Enemy ESP", Flag = "EnemyESP", Default = false,
+    Callback = function(v)
+        Flags.EnemyESP = v
+        if not v then ClearESP() end
+    end
+})
+EnemyESPToggle.Link:AddHelper({Text = "Red=enemy Green=summon"})
 
 KillAuraSection:AddDropdown({
-    Name = "Target Priority",
-    Default = Flags.TargetPriority,
+    Name = "Target Priority", Default = Flags.TargetPriority,
     Values = {"Nearest", "Lowest HP", "Highest HP", "Boss First"},
     Flag = "TargetPriority",
     Callback = function(v) Flags.TargetPriority = v CurrentTarget = nil end
@@ -754,27 +1064,39 @@ KillAuraSection:AddDropdown({
 local SpeedSection = CombatTab:DrawSection({Name = "Attack Speed", Position = "right"})
 
 SpeedSection:AddSlider({
-    Name = "Swing Cooldown",
-    Min = 0.05, Max = 1, Default = Flags.SwingCooldown, Round = 2, Flag = "SwingCooldown",
-    Callback = function(v) Flags.SwingCooldown = v end
+    Name = "Swing Cooldown", Min = 0.05, Max = 1, Default = Flags.SwingCooldown,
+    Round = 2, Flag = "SwingCooldown", Callback = function(v) Flags.SwingCooldown = v end
 })
 
 SpeedSection:AddSlider({
-    Name = "Gun Cooldown",
-    Min = 0.15, Max = 1, Default = Flags.GunCooldown, Round = 2, Flag = "GunCooldown",
-    Callback = function(v) Flags.GunCooldown = v end
+    Name = "Gun Cooldown", Min = 0.10, Max = 1, Default = Flags.GunCooldown,
+    Round = 2, Flag = "GunCooldown", Callback = function(v) Flags.GunCooldown = v end
 })
 
+SpeedSection:AddSlider({
+    Name = "Summon Cooldown", Min = 0.5, Max = 10, Default = Flags.SummonCooldown,
+    Round = 1, Flag = "SummonCooldown", Callback = function(v) Flags.SummonCooldown = v end
+})
+
+SmartCooldownToggle = SpeedSection:AddToggle({
+    Name = "Smart Cooldown", Flag = "SmartGunCooldown", Default = true,
+    Callback = function(v) Flags.SmartGunCooldown = v end
+})
+SmartCooldownToggle.Link:AddHelper({Text = "Auto fire rate per weapon"})
+
 SpeedSection:AddButton({
-    Name = "Show Weapon Stats",
+    Name = "Weapon Stats",
     Callback = function()
         local stats = GetWeaponStats()
         if stats then
             local msg = ""
             if stats.Damage then msg = msg .. "Damage: " .. stats.Damage .. "\n" end
-            if stats.CritDamage then msg = msg .. "Crit Damage: " .. stats.CritDamage .. "\n" end
-            if stats.CritChance then msg = msg .. "Crit Chance: " .. stats.CritChance .. "%\n" end
-            if stats.Speed then msg = msg .. "Speed: " .. stats.Speed end
+            if stats.CritDamage then msg = msg .. "Crit DMG: " .. stats.CritDamage .. "\n" end
+            if stats.CritChance then msg = msg .. "Crit %: " .. stats.CritChance .. "\n" end
+            if stats.Speed then msg = msg .. "Speed: " .. stats.Speed .. "\n" end
+            if stats.WeaponClass then msg = msg .. "Type: " .. stats.WeaponClass .. "\n" end
+            if stats.EffectiveCooldown then msg = msg .. "CD: " .. stats.EffectiveCooldown .. "s\n" end
+            if stats.IsSummoner then msg = msg .. "Summoner: Yes" end
             Notifier.new({Title = "Weapon Stats", Content = msg, Duration = 5, Icon = AVATAR_ICON})
         else
             Notifier.new({Title = "Error", Content = "No weapon equipped", Duration = 2, Icon = AVATAR_ICON})
@@ -782,37 +1104,34 @@ SpeedSection:AddButton({
     end
 })
 
--- ==================== TELEPORT TAB ====================
+SpeedSection:AddButton({
+    Name = "Reset Cache",
+    Callback = function()
+        WeaponCooldownCache = {}
+        Notifier.new({Title = "Cleared", Content = "Weapon cache cleared", Duration = 2, Icon = AVATAR_ICON})
+    end
+})
+
 Window:DrawCategory({Name = "TELEPORTATION"})
 local TeleportTab = Window:DrawTab({Name = "Teleport", Icon = "map-pin", EnableScrolling = true})
-
 local TeleportSection = TeleportTab:DrawSection({Name = "Auto Teleport", Position = "left"})
 
 AutoTeleportToggle = TeleportSection:AddToggle({
-    Name = "Auto Teleport",
-    Flag = "AutoTeleport",
-    Default = false,
+    Name = "Auto Teleport", Flag = "AutoTeleport", Default = false,
     Callback = function(v) Flags.AutoTeleport = v end
 })
-AutoTeleportToggle.Link:AddKeybind({
-    Default = "N",
-    Flag = "TeleportKeybind",
-    Callback = ToggleAutoTeleport
-})
+AutoTeleportToggle.Link:AddKeybind({Default = "N", Flag = "TeleportKeybind", Callback = ToggleAutoTeleport})
 AutoTeleportToggle.Link:AddHelper({Text = "Press N to toggle"})
 
 TeleportSection:AddDropdown({
-    Name = "Position",
-    Default = Flags.TeleportPosition,
+    Name = "Position", Default = Flags.TeleportPosition,
     Values = {"Back", "Front", "Left", "Right", "Top"},
-    Flag = "TeleportPosition",
-    Callback = function(v) Flags.TeleportPosition = v end
+    Flag = "TeleportPosition", Callback = function(v) Flags.TeleportPosition = v end
 })
 
 TeleportSection:AddSlider({
-    Name = "Distance",
-    Min = 1, Max = 20, Default = Flags.TeleportDistance, Round = 0, Flag = "TeleportDistance",
-    Callback = function(v) Flags.TeleportDistance = v end
+    Name = "Distance", Min = 1, Max = 20, Default = Flags.TeleportDistance,
+    Round = 0, Flag = "TeleportDistance", Callback = function(v) Flags.TeleportDistance = v end
 })
 
 local TeleportInfoSection = TeleportTab:DrawSection({Name = "Info", Position = "right"})
@@ -821,55 +1140,53 @@ TeleportInfoSection:AddParagraph({
     Content = "Locks you to the nearest enemy.\nStays at your chosen position.\nMoves to next when enemy dies."
 })
 
--- ==================== STATS TAB ====================
 Window:DrawCategory({Name = "STATS"})
 local StatsTab = Window:DrawTab({Name = "Stats", Icon = "bar-chart", EnableScrolling = true})
-
 local StatsSection = StatsTab:DrawSection({Name = "Session Stats", Position = "left"})
 
 StatsSection:AddButton({
-    Name = "Show Kill Count",
+    Name = "Kill Count",
     Callback = function()
         Notifier.new({Title = "Kills", Content = "Total: " .. KillCount .. "\nTime: " .. GetSessionTime(), Duration = 4, Icon = AVATAR_ICON})
     end
 })
 
 StatsSection:AddButton({
-    Name = "Reset Kill Count",
+    Name = "Reset Kills",
     Callback = function()
-        KillCount = 0
-        SessionStartTime = tick()
+        KillCount = 0 SessionStartTime = tick()
         Notifier.new({Title = "Reset", Content = "Kill counter reset", Duration = 2, Icon = AVATAR_ICON})
     end
 })
 
 StatsSection:AddButton({
-    Name = "Count All Enemies",
+    Name = "Entity Count",
     Callback = function()
         local enemies = GetAllEnemies()
+        local summons = GetAllSummons()
+        local mySummons = CountMySummons()
         local bosses = 0
-        for _, e in ipairs(enemies) do
-            if IsBoss(e) then bosses = bosses + 1 end
-        end
-        Notifier.new({Title = "Enemies", Content = "Total: " .. #enemies .. "\nBosses: " .. bosses, Duration = 4, Icon = AVATAR_ICON})
+        for _, e in ipairs(enemies) do if IsBoss(e) then bosses = bosses + 1 end end
+        local summoner = GetSummonerFromBackpack()
+        Notifier.new({
+            Title = "Entities",
+            Content = "Enemies: " .. #enemies .. "\nBosses: " .. bosses .. "\nAll Summons: " .. #summons .. "\nMy Summons: " .. mySummons .. "\nSummoner: " .. (summoner and summoner.Name or "None"),
+            Duration = 5, Icon = AVATAR_ICON
+        })
     end
 })
 
 local CurrentTargetSection = StatsTab:DrawSection({Name = "Current Target", Position = "right"})
 
 CurrentTargetSection:AddButton({
-    Name = "Show Target Info",
+    Name = "Target Info",
     Callback = function()
         local target = GetCurrentTarget()
         if target then
-            local hp = GetEnemyHP(target)
-            local maxHP = GetEnemyMaxHP(target)
-            local isBoss = IsBoss(target)
             Notifier.new({
                 Title = target.Name,
-                Content = "HP: " .. math.floor(hp) .. "/" .. math.floor(maxHP) .. "\nBoss: " .. (isBoss and "Yes" or "No"),
-                Duration = 4,
-                Icon = AVATAR_ICON
+                Content = "HP: " .. math.floor(GetEnemyHP(target)) .. "/" .. math.floor(GetEnemyMaxHP(target)) .. "\nBoss: " .. (IsBoss(target) and "Yes" or "No"),
+                Duration = 4, Icon = AVATAR_ICON
             })
         else
             Notifier.new({Title = "No Target", Content = "No enemy targeted", Duration = 2, Icon = AVATAR_ICON})
@@ -885,85 +1202,53 @@ CurrentTargetSection:AddButton({
     end
 })
 
--- ==================== ITEM COLLECTION (in Stats tab) ====================
 local ItemSection = StatsTab:DrawSection({Name = "Item Collection", Position = "left"})
 
--- Search bar
 ItemSection:AddTextBox({
-    Name = "Search",
-    Placeholder = "Filter items...",
-    Default = "",
-    Callback = function(v)
-        ItemSearchQuery = v or ""
-        RefreshItemList()
-    end
+    Name = "Search", Placeholder = "Filter items...", Default = "",
+    Callback = function(v) ItemSearchQuery = v or "" RefreshItemList() end
 })
 
--- Count header — uses paragraph Title which pimpleHUB renders centered/bold
-ItemCountParagraph = ItemSection:AddParagraph({
-    Title = "0 unique | 0 total",
-    Content = ""
-})
+ItemCountParagraph = ItemSection:AddParagraph({Title = "0 unique | 0 total", Content = ""})
+ItemListParagraph = ItemSection:AddParagraph({Title = "Drops", Content = "Waiting for drops..."})
 
--- Item list — content gets updated dynamically
-ItemListParagraph = ItemSection:AddParagraph({
-    Title = "Drops",
-    Content = "Waiting for drops..."
-})
-
--- Clear button
 ItemSection:AddButton({
-    Name = "Clear Item Log",
+    Name = "Clear Items",
     Callback = function()
-        ItemLog = {}
-        ItemLogMap = {}
-        TotalItemsCollected = 0
-        ItemSearchQuery = ""
+        ItemLog = {} ItemLogMap = {} TotalItemsCollected = 0 ItemSearchQuery = ""
         RefreshItemList()
         Notifier.new({Title = "Cleared", Content = "Item log cleared", Duration = 2, Icon = AVATAR_ICON})
     end
 })
 
--- ==================== PLAYER TAB ====================
 Window:DrawCategory({Name = "PLAYER"})
 local PlayerTab = Window:DrawTab({Name = "Player", Icon = "user", EnableScrolling = true})
-
 local MovementSection = PlayerTab:DrawSection({Name = "Movement", Position = "left"})
 
 MovementSection:AddSlider({
-    Name = "Walk Speed",
-    Min = 16, Max = 500, Default = Flags.WalkSpeed, Round = 0, Flag = "WalkSpeed",
-    Callback = function(v) Flags.WalkSpeed = v ApplyMovementStats() end
+    Name = "Walk Speed", Min = 16, Max = 500, Default = Flags.WalkSpeed,
+    Round = 0, Flag = "WalkSpeed", Callback = function(v) Flags.WalkSpeed = v ApplyMovementStats() end
 })
 
 MovementSection:AddSlider({
-    Name = "Jump Power",
-    Min = 50, Max = 500, Default = Flags.JumpPower, Round = 0, Flag = "JumpPower",
-    Callback = function(v) Flags.JumpPower = v ApplyMovementStats() end
+    Name = "Jump Power", Min = 50, Max = 500, Default = Flags.JumpPower,
+    Round = 0, Flag = "JumpPower", Callback = function(v) Flags.JumpPower = v ApplyMovementStats() end
 })
 
 MovementSection:AddToggle({
-    Name = "Enforce Speed",
-    Flag = "SpeedEnforce",
-    Default = Flags.SpeedEnforce,
+    Name = "Enforce Speed", Flag = "SpeedEnforce", Default = Flags.SpeedEnforce,
     Callback = function(v) Flags.SpeedEnforce = v end
 })
 
 MovementSection:AddButton({
     Name = "Reset Movement",
-    Callback = function()
-        Flags.WalkSpeed = 16
-        Flags.JumpPower = 50
-        ApplyMovementStats()
-    end
+    Callback = function() Flags.WalkSpeed = 16 Flags.JumpPower = 50 ApplyMovementStats() end
 })
 
 local WeaponSection = PlayerTab:DrawSection({Name = "Weapon", Position = "right"})
 
 WeaponSection:AddToggle({
-    Name = "Auto Re-equip",
-    Flag = "AutoReequip",
-    Default = Flags.AutoReequip,
+    Name = "Auto Re-equip", Flag = "AutoReequip", Default = Flags.AutoReequip,
     Callback = function(v) Flags.AutoReequip = v end
 })
 
@@ -971,77 +1256,35 @@ WeaponSection:AddButton({
     Name = "Show Equipped",
     Callback = function()
         local tool = GetEquippedTool()
-        Notifier.new({Title = "Equipped", Content = tool and tool.Name or "None", Duration = 3, Icon = AVATAR_ICON})
+        if tool then
+            local class, cd = ClassifyWeapon(tool)
+            local isSummoner = IsSummonerTool(tool)
+            Notifier.new({Title = "Equipped", Content = tool.Name .. "\nType: " .. class .. "\nCD: " .. cd .. "s" .. (isSummoner and "\nSummoner: Yes" or ""), Duration = 3, Icon = AVATAR_ICON})
+        else
+            Notifier.new({Title = "Equipped", Content = "None", Duration = 3, Icon = AVATAR_ICON})
+        end
     end
 })
 
--- ==================== SETTINGS TAB ====================
 Window:DrawCategory({Name = "SETTINGS"})
-
 local SettingsTab = Window:DrawTab({Name = "Settings", Icon = "settings-3", Type = "Single", EnableScrolling = true})
 local ThemesTab = Window:DrawTab({Name = "Themes", Icon = "paintbrush", Type = "Single"})
-
 local UISettings = SettingsTab:DrawSection({Name = "UI Settings", Position = "left"})
 
-UISettings:AddToggle({
-    Name = "Always Show Frame",
-    Default = false,
-    Callback = function(v) Window.AlwayShowTab = v end
-})
+UISettings:AddToggle({Name = "Always Show Frame", Default = false, Callback = function(v) Window.AlwayShowTab = v end})
 
-UISettings:AddColorPicker({
-    Name = "Highlight",
-    Default = pimpleHUB.Colors.Highlight,
-    Callback = function(v)
-        pimpleHUB.Colors.Highlight = v
-        pimpleHUB:RefreshCurrentColor()
-    end
-})
-
-UISettings:AddColorPicker({
-    Name = "Toggle Color",
-    Default = pimpleHUB.Colors.Toggle,
-    Callback = function(v)
-        pimpleHUB.Colors.Toggle = v
-        pimpleHUB:RefreshCurrentColor()
-    end
-})
-
-UISettings:AddColorPicker({
-    Name = "Drop Color",
-    Default = pimpleHUB.Colors.DropColor,
-    Callback = function(v)
-        pimpleHUB.Colors.DropColor = v
-        pimpleHUB:RefreshCurrentColor()
-    end
-})
-
-UISettings:AddColorPicker({
-    Name = "Block Color",
-    Default = pimpleHUB.Colors.BlockColor,
-    Callback = function(v)
-        pimpleHUB.Colors.BlockColor = v
-        pimpleHUB:RefreshCurrentColor()
-    end
-})
-
-UISettings:AddColorPicker({
-    Name = "Background Color",
-    Default = pimpleHUB.Colors.BGDBColor,
-    Callback = function(v)
-        pimpleHUB.Colors.BGDBColor = v
-        pimpleHUB:RefreshCurrentColor()
-    end
-})
-
-UISettings:AddColorPicker({
-    Name = "Stroke Color",
-    Default = pimpleHUB.Colors.StrokeColor,
-    Callback = function(v)
-        pimpleHUB.Colors.StrokeColor = v
-        pimpleHUB:RefreshCurrentColor()
-    end
-})
+UISettings:AddColorPicker({Name = "Highlight", Default = pimpleHUB.Colors.Highlight,
+    Callback = function(v) pimpleHUB.Colors.Highlight = v pimpleHUB:RefreshCurrentColor() end})
+UISettings:AddColorPicker({Name = "Toggle Color", Default = pimpleHUB.Colors.Toggle,
+    Callback = function(v) pimpleHUB.Colors.Toggle = v pimpleHUB:RefreshCurrentColor() end})
+UISettings:AddColorPicker({Name = "Drop Color", Default = pimpleHUB.Colors.DropColor,
+    Callback = function(v) pimpleHUB.Colors.DropColor = v pimpleHUB:RefreshCurrentColor() end})
+UISettings:AddColorPicker({Name = "Block Color", Default = pimpleHUB.Colors.BlockColor,
+    Callback = function(v) pimpleHUB.Colors.BlockColor = v pimpleHUB:RefreshCurrentColor() end})
+UISettings:AddColorPicker({Name = "Background Color", Default = pimpleHUB.Colors.BGDBColor,
+    Callback = function(v) pimpleHUB.Colors.BGDBColor = v pimpleHUB:RefreshCurrentColor() end})
+UISettings:AddColorPicker({Name = "Stroke Color", Default = pimpleHUB.Colors.StrokeColor,
+    Callback = function(v) pimpleHUB.Colors.StrokeColor = v pimpleHUB:RefreshCurrentColor() end})
 
 UISettings:AddButton({
     Name = "Copy Discord",
@@ -1054,41 +1297,26 @@ UISettings:AddButton({
 local InfoSection = SettingsTab:DrawSection({Name = "Info", Position = "right"})
 InfoSection:AddParagraph({
     Title = "pimpleHUB v6.0",
-    Content = "Balanced Craftwars Script\n\nKeybinds:\nLeft Alt - Toggle UI\nV - Toggle Auto Swing\nB - Toggle Auto Gun\nN - Toggle Auto Teleport"
+    Content = "Balanced Craftwars Script\n\nKeybinds:\nLeft Alt - Toggle UI\nV - Auto Swing\nB - Auto Gun\nN - Auto Teleport"
 })
 
 local ThemeSettings = ThemesTab:DrawSection({Name = "UI Themes", Position = "left"})
-
 ThemeSettings:AddDropdown({
-    Name = "Select Theme",
-    Default = "Default",
+    Name = "Select Theme", Default = "Default",
     Values = {"Default", "Dark Green", "Dark Blue", "Purple Rose", "Skeet"},
-    Callback = function(v)
-        pimpleHUB:SetTheme(v)
-    end
+    Callback = function(v) pimpleHUB:SetTheme(v) end
 })
 
-local ConfigUI = Window:DrawConfig({
-    Name = "Config",
-    Icon = "folder",
-    Config = ConfigManager
-})
-
+local ConfigUI = Window:DrawConfig({Name = "Config", Icon = "folder", Config = ConfigManager})
 ConfigUI:Init()
 
--- ==================== INPUT HANDLER ====================
 AddConnection(UserInputService.InputBegan:Connect(function(input, gameProcessed)
     if gameProcessed or IsTyping() then return end
-    if input.KeyCode == Enum.KeyCode.V then
-        ToggleAutoSwing()
-    elseif input.KeyCode == Enum.KeyCode.B then
-        ToggleAutoGun()
-    elseif input.KeyCode == Enum.KeyCode.N then
-        ToggleAutoTeleport()
-    end
+    if input.KeyCode == Enum.KeyCode.V then ToggleAutoSwing()
+    elseif input.KeyCode == Enum.KeyCode.B then ToggleAutoGun()
+    elseif input.KeyCode == Enum.KeyCode.N then ToggleAutoTeleport() end
 end))
 
--- ==================== MAIN LOOPS ====================
 AddConnection(RunService.RenderStepped:Connect(function()
     if Flags.AutoTeleport then TeleportToTarget() end
 end))
@@ -1097,6 +1325,8 @@ AddConnection(RunService.Heartbeat:Connect(function(dt)
     SwingTimer = SwingTimer + dt
     GunTimer = GunTimer + dt
     SpeedTimer = SpeedTimer + dt
+    ESPTimer = ESPTimer + dt
+    SummonTimer = SummonTimer + dt
 
     if Flags.SpeedEnforce and SpeedTimer >= 0.5 then
         SpeedTimer = 0
@@ -1108,11 +1338,21 @@ AddConnection(RunService.Heartbeat:Connect(function(dt)
         task.spawn(PerformSwordAttack)
     end
 
-    if Flags.AutoGun and GunTimer >= Flags.GunCooldown then
+    local effectiveGunCD = GetEffectiveGunCooldown()
+    if Flags.AutoGun and GunTimer >= effectiveGunCD then
         GunTimer = 0
         task.spawn(PerformGunAttack)
     end
+
+    if Flags.EnemyESP and ESPTimer >= 2 then
+        ESPTimer = 0
+        task.spawn(UpdateESP)
+    end
+
+    if Flags.AutoSummon and SummonTimer >= Flags.SummonCooldown then
+        SummonTimer = 0
+        task.spawn(TryAutoSummon)
+    end
 end))
 
--- ==================== START CHAT LISTENER ====================
 task.spawn(SetupChatListener)
