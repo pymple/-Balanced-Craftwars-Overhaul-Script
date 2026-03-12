@@ -1212,7 +1212,7 @@ AutoSwingToggle = KillAuraSection:AddToggle({
         end
     end
 })
-AutoSwingToggle.Link:AddKeybind({Default = "V", Flag = "SwingKeybind", Callback = function() end})
+AutoSwingToggle.Link:AddKeybind({Default = "V", Flag = "SwingKeybind", Callback = function(v) Flags.SwingKeybind = v end})
 AutoSwingToggle.Link:AddHelper({Text = "Fires melee weapon RF without switching your equipped slot"})
 
 AutoGunToggle = KillAuraSection:AddToggle({
@@ -1225,14 +1225,14 @@ AutoGunToggle = KillAuraSection:AddToggle({
         end
     end
 })
-AutoGunToggle.Link:AddKeybind({Default = "B", Flag = "GunKeybind", Callback = function() end})
+AutoGunToggle.Link:AddKeybind({Default = "B", Flag = "GunKeybind", Callback = function(v) Flags.GunKeybind = v end})
 AutoGunToggle.Link:AddHelper({Text = "Fires gun RE without switching your equipped slot"})
 
 AutoSummonToggle = KillAuraSection:AddToggle({
     Name = "Auto Summon", Flag = "AutoSummon", Default = false,
     Callback = function(v) Flags.AutoSummon = v end
 })
-AutoSummonToggle.Link:AddKeybind({Default = "G", Flag = "SummonKeybind", Callback = function() end})
+AutoSummonToggle.Link:AddKeybind({Default = "G", Flag = "SummonKeybind", Callback = function(v) Flags.SummonKeybind = v end})
 AutoSummonToggle.Link:AddHelper({Text = "Uses summon items automatically"})
 
 EnemyESPToggle = KillAuraSection:AddToggle({
@@ -1319,7 +1319,7 @@ AutoTeleportToggle = TeleportSection:AddToggle({
     Name = "Auto Teleport", Flag = "AutoTeleport", Default = false,
     Callback = function(v) Flags.AutoTeleport = v end
 })
-AutoTeleportToggle.Link:AddKeybind({Default = "N", Flag = "TeleportKeybind", Callback = function() end})
+AutoTeleportToggle.Link:AddKeybind({Default = "N", Flag = "TeleportKeybind", Callback = function(v) Flags.TeleportKeybind = v end})
 AutoTeleportToggle.Link:AddHelper({Text = "Teleports next to your target (keybind remappable)"})
 
 TeleportSection:AddDropdown({
