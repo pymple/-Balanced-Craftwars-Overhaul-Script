@@ -218,6 +218,19 @@ local function IsSummonerTool(tool)
     return false
 end
 
+local function IsNonCombatTool(tool)
+    if not tool or not tool:IsA("Tool") then return false end
+    -- A tool with neither RemoteFunction nor RemoteEvent cannot perform combat actions
+    if not tool:FindFirstChild("RemoteFunction") and not tool:FindFirstChild("RemoteEvent") then return true end
+    -- Name-based check for common non-combat tools
+    local nameLower = tool.Name:lower()
+    local nonCombatKeywords = {"pickaxe", "pick", "mining", "shovel", "drill", "harvest", "hoe", "spade", "lumber", "chop", "farm", "gather"}
+    for _, kw in ipairs(nonCombatKeywords) do
+        if nameLower:find(kw, 1, true) then return true end
+    end
+    return false
+end
+
 local function GetSummonerFromBackpack()
     local backpack = LocalPlayer:FindFirstChild("Backpack")
     if backpack then
@@ -276,7 +289,7 @@ local function ActivateSummonerTool(tool)
 
     local currentTool = GetEquippedTool()
     local previousWeapon = nil
-    if currentTool and currentTool ~= tool and not IsSummonerTool(currentTool) then
+    if currentTool and currentTool ~= tool and not IsSummonerTool(currentTool) and not IsNonCombatTool(currentTool) then
         previousWeapon = currentTool.Name
     end
 
@@ -621,7 +634,7 @@ local function PerformSwordAttack()
         if backpack then
             -- First pass: prefer melee weapons (has RF but no RE)
             for _, item in ipairs(backpack:GetChildren()) do
-                if item:IsA("Tool") and not IsSummonerTool(item) then
+                if item:IsA("Tool") and not IsSummonerTool(item) and not IsNonCombatTool(item) then
                     local rf = item:FindFirstChild("RemoteFunction")
                     if rf and not item:FindFirstChild("RemoteEvent") then
                         local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
@@ -631,10 +644,10 @@ local function PerformSwordAttack()
                     end
                 end
             end
-            -- Fallback: equip any non-summoner tool with a RemoteFunction
+            -- Fallback: equip any non-summoner combat tool with a RemoteFunction
             if not tool or IsSummonerTool(tool) then
                 for _, item in ipairs(backpack:GetChildren()) do
-                    if item:IsA("Tool") and not IsSummonerTool(item) and item:FindFirstChild("RemoteFunction") then
+                    if item:IsA("Tool") and not IsSummonerTool(item) and not IsNonCombatTool(item) and item:FindFirstChild("RemoteFunction") then
                         local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
                         if hum then hum:EquipTool(item) end
                         tool = item
@@ -672,7 +685,7 @@ local function PerformGunAttack()
         if backpack then
             -- First pass: prefer guns (has RemoteEvent)
             for _, item in ipairs(backpack:GetChildren()) do
-                if item:IsA("Tool") and not IsSummonerTool(item) then
+                if item:IsA("Tool") and not IsSummonerTool(item) and not IsNonCombatTool(item) then
                     local re = item:FindFirstChild("RemoteEvent")
                     if re then
                         local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
@@ -682,10 +695,10 @@ local function PerformGunAttack()
                     end
                 end
             end
-            -- Fallback: equip any non-summoner tool
+            -- Fallback: equip any non-summoner combat tool with RemoteFunction
             if not tool or IsSummonerTool(tool) then
                 for _, item in ipairs(backpack:GetChildren()) do
-                    if item:IsA("Tool") and not IsSummonerTool(item) then
+                    if item:IsA("Tool") and not IsSummonerTool(item) and not IsNonCombatTool(item) and item:FindFirstChild("RemoteFunction") then
                         local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
                         if hum then hum:EquipTool(item) end
                         tool = item
@@ -698,6 +711,7 @@ local function PerformGunAttack()
 
     if not tool then return end
     if IsSummonerTool(tool) then return end
+    if IsNonCombatTool(tool) then return end
     local target = GetCurrentTarget()
     if not target then return end
     local targetPos = GetEnemyPosition(target)
