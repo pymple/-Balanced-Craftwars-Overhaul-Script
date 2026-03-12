@@ -15,7 +15,7 @@ local Flags = {
     AutoGun = false,
     AutoTeleport = false,
     AutoSummon = false,
-    SmartGunCooldown = true,
+    SmartGunCooldown = false,
     EnemyESP = false,
     AllyESP = false,
     TeleportPosition = "Back",
@@ -28,11 +28,20 @@ local Flags = {
     JumpPower = 50,
     AutoReequip = true,
     SpeedEnforce = true,
+    SwingKeybind = "V",
+    GunKeybind = "B",
+    SummonKeybind = "G",
+    TeleportKeybind = "N",
 }
 
 local SwingTimer, GunTimer, SpeedTimer, SummonTimer = 0, 0, 0, 0
 local CurrentTarget = nil
 local LastEquippedWeapon = nil
+-- The last non-summoner, non-combat tool the player personally had equipped.
+-- Updated every heartbeat (when not summoning) so post-summon restore always
+-- returns to whichever weapon the player was using before.
+local LastPlayerWeapon = nil
+local IsSummoning = false
 local KillCount = 0
 local SessionStartTime = tick()
 local pimpleHUB, Notifier, Window, ConfigManager
@@ -40,6 +49,7 @@ local AutoSwingToggle, AutoGunToggle, AutoTeleportToggle, SmartCooldownToggle, E
 local UIOpen = true
 
 local MAX_ITEMS = 50
+local NON_COMBAT_KEYWORDS = {"pickaxe", "pick", "mining", "shovel", "drill", "harvest", "hoe", "spade", "lumber", "chop", "farm", "gather"}
 local ItemLog = {}
 local ItemLogMap = {}
 local TotalItemsCollected = 0
@@ -84,17 +94,30 @@ end
 
 local function ToggleAutoSwing()
     Flags.AutoSwing = not Flags.AutoSwing
+    if Flags.AutoSwing and Flags.AutoGun then
+        Flags.AutoGun = false
+        UpdateToggleState(AutoGunToggle, false)
+    end
     UpdateToggleState(AutoSwingToggle, Flags.AutoSwing)
 end
 
 local function ToggleAutoGun()
     Flags.AutoGun = not Flags.AutoGun
+    if Flags.AutoGun and Flags.AutoSwing then
+        Flags.AutoSwing = false
+        UpdateToggleState(AutoSwingToggle, false)
+    end
     UpdateToggleState(AutoGunToggle, Flags.AutoGun)
 end
 
 local function ToggleAutoTeleport()
     Flags.AutoTeleport = not Flags.AutoTeleport
     UpdateToggleState(AutoTeleportToggle, Flags.AutoTeleport)
+end
+
+local function ToggleAutoSummon()
+    Flags.AutoSummon = not Flags.AutoSummon
+    UpdateToggleState(AutoSummonToggle, Flags.AutoSummon)
 end
 
 local function ApplyMovementStats()
@@ -210,6 +233,112 @@ local function IsSummonerTool(tool)
     return false
 end
 
+local function IsNonCombatTool(tool)
+    if not tool or not tool:IsA("Tool") then return false end
+    -- A tool with neither RemoteFunction nor RemoteEvent cannot perform combat actions
+    if not tool:FindFirstChild("RemoteFunction") and not tool:FindFirstChild("RemoteEvent") then return true end
+    -- Name-based check for common non-combat tools
+    local nameLower = tool.Name:lower()
+    for _, kw in ipairs(NON_COMBAT_KEYWORDS) do
+        if nameLower:find(kw, 1, true) then return true end
+    end
+    return false
+end
+
+-- Returns true if the tool is a ranged/gun weapon.
+-- Classification priority (highest to lowest):
+--  1. Explicit gun-attribute children  → always ranged
+--  2. RE only, no RF                   → ranged (gun fires via RE)
+--  3. RF only, no RE                   → melee (sword fires via RF)
+--  4. Both RE + RF                     → check name; sword keywords → melee, else → ranged
+--     (Craftwars guns commonly carry both remotes; the old "RF = always melee" rule was wrong)
+local SWORD_NAME_KEYWORDS = {"sword", "blade", "katana", "saber", "sabre", "axe", "hammer",
+    "mace", "club", "dagger", "knife", "lance", "spear", "scythe", "cleaver",
+    "excalibur", "falchion", "rapier", "halberd", "partisan", "glaive"}
+local function IsRangedWeapon(tool)
+    if not tool then return false end
+    -- Gun-specific attribute children always indicate a ranged weapon
+    if tool:FindFirstChild("GunThrowerMain")        then return true end
+    if tool:FindFirstChild("RangedSpread")          then return true end
+    if tool:FindFirstChild("RangedPower")           then return true end
+    if tool:FindFirstChild("RangedProjectileAmount")then return true end
+    if tool:FindFirstChild("ProjectileSpeed")       then return true end
+    if tool:FindFirstChild("FireRate")              then return true end
+    if tool:FindFirstChild("ShootCooldown")         then return true end
+    if tool:FindFirstChild("FireDelay")             then return true end
+    if tool:FindFirstChild("ShootSpeed")            then return true end
+    if tool:FindFirstChild("RateOfFire")            then return true end
+
+    local hasRE = tool:FindFirstChild("RemoteEvent")   ~= nil
+    local hasRF = tool:FindFirstChild("RemoteFunction") ~= nil
+
+    if hasRF and not hasRE then return false end  -- RF-only → definitively melee
+    if hasRE and not hasRF then return true  end  -- RE-only → definitively ranged
+
+    -- Both RE + RF: use sword name keywords; if none match, treat as ranged
+    -- (Gun attack fires via RE — having RE is the primary ranged signal)
+    if hasRE and hasRF then
+        local nameLower = tool.Name:lower()
+        for _, kw in ipairs(SWORD_NAME_KEYWORDS) do
+            if nameLower:find(kw, 1, true) then return false end
+        end
+        return true
+    end
+
+    return false
+end
+
+local function GetBestMeleeWeapon()
+    local best = nil
+    local bestDamage = -1
+    local function Check(container)
+        for _, item in ipairs(container:GetChildren()) do
+            if item:IsA("Tool") and not IsSummonerTool(item) and not IsNonCombatTool(item) then
+                -- Pure melee: has RemoteFunction and is NOT a ranged weapon
+                local rf = item:FindFirstChild("RemoteFunction")
+                if rf and not IsRangedWeapon(item) then
+                    local dmgVal = item:FindFirstChild("Damage")
+                    local dmg = dmgVal and tonumber(dmgVal.Value) or 0
+                    if not best or dmg > bestDamage then
+                        bestDamage = dmg
+                        best = item
+                    end
+                end
+            end
+        end
+    end
+    local backpack = LocalPlayer:FindFirstChild("Backpack")
+    if backpack then Check(backpack) end
+    local char = LocalPlayer.Character
+    if char then Check(char) end
+    return best
+end
+
+local function GetBestGunWeapon()
+    local best = nil
+    local bestDamage = -1
+    local function Check(container)
+        for _, item in ipairs(container:GetChildren()) do
+            if item:IsA("Tool") and not IsSummonerTool(item) and not IsNonCombatTool(item) then
+                -- Any ranged weapon: RE, RF-only cannon, GunThrowerMain, etc.
+                if IsRangedWeapon(item) then
+                    local dmgVal = item:FindFirstChild("Damage")
+                    local dmg = dmgVal and tonumber(dmgVal.Value) or 0
+                    if not best or dmg > bestDamage then
+                        bestDamage = dmg
+                        best = item
+                    end
+                end
+            end
+        end
+    end
+    local backpack = LocalPlayer:FindFirstChild("Backpack")
+    if backpack then Check(backpack) end
+    local char = LocalPlayer.Character
+    if char then Check(char) end
+    return best
+end
+
 local function GetSummonerFromBackpack()
     local backpack = LocalPlayer:FindFirstChild("Backpack")
     if backpack then
@@ -266,13 +395,9 @@ local function ActivateSummonerTool(tool)
     local hum = char:FindFirstChildOfClass("Humanoid")
     if not hum then return end
 
-    local currentTool = GetEquippedTool()
-    local previousWeapon = nil
-    if currentTool and currentTool ~= tool and not IsSummonerTool(currentTool) then
-        previousWeapon = currentTool.Name
-    end
+    IsSummoning = true
 
-    if currentTool ~= tool then
+    if GetEquippedTool() ~= tool then
         hum:EquipTool(tool)
         task.wait(0.15)
     end
@@ -289,15 +414,29 @@ local function ActivateSummonerTool(tool)
         pcall(function() re:FireServer("hit", {80, 1}) end)
     end
 
-    if previousWeapon then
-        task.delay(0.3, function()
-            EquipWeaponByName(previousWeapon)
-        end)
-    elseif LastEquippedWeapon and not IsSummonerTool(tool) == false then
-        task.delay(0.3, function()
-            EquipWeaponByName(LastEquippedWeapon)
-        end)
-    end
+    -- Re-equip the weapon the player was using before we switched to the summoner.
+    -- LastPlayerWeapon is kept current by the heartbeat loop and won't be updated
+    -- while IsSummoning is true, so it still points to the pre-summon weapon here.
+    task.delay(0.5, function()
+        local hum2 = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+        if hum2 then
+            local restored = false
+            if LastPlayerWeapon then
+                local parent = LastPlayerWeapon.Parent
+                if parent == LocalPlayer:FindFirstChild("Backpack") or parent == LocalPlayer.Character then
+                    hum2:EquipTool(LastPlayerWeapon)
+                    restored = true
+                end
+            end
+            if not restored then
+                local bestWeapon = Flags.AutoGun and GetBestGunWeapon() or GetBestMeleeWeapon()
+                if bestWeapon then hum2:EquipTool(bestWeapon) end
+            end
+        end
+    end)
+    task.delay(0.65, function()
+        IsSummoning = false
+    end)
 end
 
 local function TryAutoSummon()
@@ -392,11 +531,17 @@ local function ClassifyWeapon(tool)
 end
 
 local function GetEffectiveGunCooldown()
-    if not Flags.SmartGunCooldown then return Flags.GunCooldown end
-    local tool = GetEquippedTool()
-    if not tool then return Flags.GunCooldown end
-    local _, cd = ClassifyWeapon(tool)
-    return cd
+    -- Smart Cooldown ON  → use the weapon's own detected fire rate (ignores slider;
+    --                       turn Smart Cooldown OFF to use the slider directly).
+    -- Smart Cooldown OFF → use the Gun Cooldown slider value exactly.
+    if Flags.SmartGunCooldown then
+        local tool = GetEquippedTool()
+        if tool then
+            local _, weaponCd = ClassifyWeapon(tool)
+            return weaponCd
+        end
+    end
+    return Flags.GunCooldown
 end
 
 local function GetWeaponStats()
@@ -605,29 +750,70 @@ local function TeleportToTarget()
 end
 
 local function PerformSwordAttack()
-    local tool = GetEquippedTool()
+    if IsSummoning then return end
+    if not GetCurrentTarget() then return end
+
+    -- Prefer the currently equipped tool: if the player manually equipped a sword
+    -- (or any tool with a RemoteFunction), fire it directly without any classification.
+    local tool = nil
+    local equipped = GetEquippedTool()
+    if equipped and not IsSummonerTool(equipped) and not IsNonCombatTool(equipped)
+        and equipped:FindFirstChild("RemoteFunction") then
+        tool = equipped
+    end
+
+    -- Fall back to the best classified melee weapon found in backpack/character.
+    if not tool then
+        tool = GetBestMeleeWeapon()
+    end
+
     if not tool then return end
-    if IsSummonerTool(tool) then return end
     local rf = tool:FindFirstChild("RemoteFunction")
     if not rf then return end
-    if not GetCurrentTarget() then return end
+    local dmgVal = tool:FindFirstChild("Damage")
+    local dmg = dmgVal and tonumber(dmgVal.Value) or 80
     LastEquippedWeapon = tool.Name
-    pcall(function() rf:InvokeServer("hit", {80, 1}) end)
-end
-
-local function GetToolFirePoint(tool)
-    if not tool then return nil end
-    local barrel = tool:FindFirstChild("Barrel") or tool:FindFirstChild("Muzzle") or tool:FindFirstChild("FirePoint") or tool:FindFirstChild("ShootPart")
-    if barrel and barrel:IsA("BasePart") then return barrel end
-    local handle = tool:FindFirstChild("Handle")
-    if handle and handle:IsA("BasePart") then return handle end
-    return nil
+    pcall(function() rf:InvokeServer("hit", {dmg, 1}) end)
 end
 
 local function PerformGunAttack()
-    local tool = GetEquippedTool()
+    if IsSummoning then return end
+
+    -- Find a gun to fire WITHOUT switching the player's equipped weapon.
+    -- Strategy: check equipped tool first (player chose it), then search backpack.
+    -- We identify a "gun" purely by RemoteEvent presence — no name/keyword guessing.
+    local function IsValidGunTool(item)
+        return item and item:IsA("Tool")
+            and not IsSummonerTool(item) and not IsNonCombatTool(item)
+            and item:FindFirstChild("RemoteEvent") ~= nil
+    end
+
+    local tool = nil
+
+    local equipped = GetEquippedTool()
+    if IsValidGunTool(equipped) then
+        tool = equipped
+    end
+
+    if not tool then
+        -- Search backpack then character for any non-summoner tool with a RemoteEvent
+        local function FindRE(container)
+            for _, item in ipairs(container:GetChildren()) do
+                if IsValidGunTool(item) then return item end
+            end
+            return nil
+        end
+        local backpack = LocalPlayer:FindFirstChild("Backpack")
+        if backpack then tool = FindRE(backpack) end
+        if not tool then
+            local char = LocalPlayer.Character
+            if char then tool = FindRE(char) end
+        end
+    end
+
     if not tool then return end
-    if IsSummonerTool(tool) then return end
+    local re = tool:FindFirstChild("RemoteEvent")
+    if not re then return end
     local target = GetCurrentTarget()
     if not target then return end
     local targetPos = GetEnemyPosition(target)
@@ -637,25 +823,11 @@ local function PerformGunAttack()
     if not char then return end
     local hrp = char:FindFirstChild("HumanoidRootPart")
     if not hrp then return end
-    local re = tool:FindFirstChild("RemoteEvent")
-    local rf = tool:FindFirstChild("RemoteFunction")
-    local dmgVal = tool:FindFirstChild("Damage")
-    local dmg = dmgVal and dmgVal.Value or 20
 
     local enemyHRP = GetEnemyHRP(target)
     if enemyHRP then targetPos = enemyHRP.Position end
 
-    local firePoint = GetToolFirePoint(tool)
-    local firePos = firePoint and firePoint.Position or hrp.Position
-    local aimCF = CFrame.lookAt(firePos, targetPos)
-
-    if re then
-        pcall(function() re:FireServer("hit", {["mhit"] = targetPos}) end)
-    end
-    if rf then
-        pcall(function() rf:InvokeServer("shoot", {aimCF, dmg}) end)
-        pcall(function() rf:InvokeServer("shoot", aimCF, dmg) end)
-    end
+    pcall(function() re:FireServer("hit", {["mhit"] = targetPos}) end)
 end
 
 local function GetSessionTime()
@@ -1009,7 +1181,7 @@ Window.OnToggle = function(visible) UIOpen = visible end
 
 Notifier.new({
     Title = "pimpleHUB Loaded",
-    Content = "Left Alt = UI | V = Swing | B = Gun\nN = Teleport",
+    Content = "Left Alt = UI | V = Swing | B = Gun | G = Summon\nN = Teleport",
     Duration = 5,
     Icon = AVATAR_ICON
 })
@@ -1032,23 +1204,36 @@ local KillAuraSection = CombatTab:DrawSection({Name = "Kill Aura", Position = "l
 
 AutoSwingToggle = KillAuraSection:AddToggle({
     Name = "Auto Swing", Flag = "AutoSwing", Default = false,
-    Callback = function(v) Flags.AutoSwing = v end
+    Callback = function(v)
+        Flags.AutoSwing = v
+        if v and Flags.AutoGun then
+            Flags.AutoGun = false
+            UpdateToggleState(AutoGunToggle, false)
+        end
+    end
 })
-AutoSwingToggle.Link:AddKeybind({Default = "V", Flag = "SwingKeybind", Callback = ToggleAutoSwing})
-AutoSwingToggle.Link:AddHelper({Text = "Melee: RF 'hit'"})
+AutoSwingToggle.Link:AddKeybind({Default = "V", Flag = "SwingKeybind", Callback = function() end})
+AutoSwingToggle.Link:AddHelper({Text = "Fires melee weapon RF without switching your equipped slot"})
 
 AutoGunToggle = KillAuraSection:AddToggle({
     Name = "Auto Gun", Flag = "AutoGun", Default = false,
-    Callback = function(v) Flags.AutoGun = v end
+    Callback = function(v)
+        Flags.AutoGun = v
+        if v and Flags.AutoSwing then
+            Flags.AutoSwing = false
+            UpdateToggleState(AutoSwingToggle, false)
+        end
+    end
 })
-AutoGunToggle.Link:AddKeybind({Default = "B", Flag = "GunKeybind", Callback = ToggleAutoGun})
-AutoGunToggle.Link:AddHelper({Text = "All guns: RE + RF"})
+AutoGunToggle.Link:AddKeybind({Default = "B", Flag = "GunKeybind", Callback = function() end})
+AutoGunToggle.Link:AddHelper({Text = "Fires gun RE without switching your equipped slot"})
 
 AutoSummonToggle = KillAuraSection:AddToggle({
     Name = "Auto Summon", Flag = "AutoSummon", Default = false,
     Callback = function(v) Flags.AutoSummon = v end
 })
-AutoSummonToggle.Link:AddHelper({Text = "Uses summon items auto"})
+AutoSummonToggle.Link:AddKeybind({Default = "G", Flag = "SummonKeybind", Callback = function() end})
+AutoSummonToggle.Link:AddHelper({Text = "Uses summon items automatically"})
 
 EnemyESPToggle = KillAuraSection:AddToggle({
     Name = "Enemy ESP", Flag = "EnemyESP", Default = false,
@@ -1093,10 +1278,10 @@ SpeedSection:AddSlider({
 })
 
 SmartCooldownToggle = SpeedSection:AddToggle({
-    Name = "Smart Cooldown", Flag = "SmartGunCooldown", Default = true,
+    Name = "Smart Cooldown", Flag = "SmartGunCooldown", Default = false,
     Callback = function(v) Flags.SmartGunCooldown = v end
 })
-SmartCooldownToggle.Link:AddHelper({Text = "Auto fire rate per weapon"})
+SmartCooldownToggle.Link:AddHelper({Text = "Uses weapon's own fire rate (overrides slider when ON)"})
 
 SpeedSection:AddButton({
     Name = "Weapon Stats",
@@ -1134,8 +1319,8 @@ AutoTeleportToggle = TeleportSection:AddToggle({
     Name = "Auto Teleport", Flag = "AutoTeleport", Default = false,
     Callback = function(v) Flags.AutoTeleport = v end
 })
-AutoTeleportToggle.Link:AddKeybind({Default = "N", Flag = "TeleportKeybind", Callback = ToggleAutoTeleport})
-AutoTeleportToggle.Link:AddHelper({Text = "Press N to toggle"})
+AutoTeleportToggle.Link:AddKeybind({Default = "N", Flag = "TeleportKeybind", Callback = function() end})
+AutoTeleportToggle.Link:AddHelper({Text = "Teleports next to your target (keybind remappable)"})
 
 TeleportSection:AddDropdown({
     Name = "Position", Default = Flags.TeleportPosition,
@@ -1311,7 +1496,7 @@ UISettings:AddButton({
 local InfoSection = SettingsTab:DrawSection({Name = "Info", Position = "right"})
 InfoSection:AddParagraph({
     Title = "pimpleHUB v6.0",
-    Content = "Balanced Craftwars Script\n\nKeybinds:\nLeft Alt - Toggle UI\nV - Auto Swing\nB - Auto Gun\nN - Auto Teleport"
+    Content = "Balanced Craftwars Script\n\nKeybinds are remappable in the UI.\nLeft Alt - Toggle UI\nDefaults: V - Auto Swing, B - Auto Gun\nG - Auto Summon, N - Auto Teleport"
 })
 
 local ThemeSettings = ThemesTab:DrawSection({Name = "UI Themes", Position = "left"})
@@ -1326,9 +1511,15 @@ ConfigUI:Init()
 
 AddConnection(UserInputService.InputBegan:Connect(function(input, gameProcessed)
     if gameProcessed or IsTyping() then return end
-    if input.KeyCode == Enum.KeyCode.V then ToggleAutoSwing()
-    elseif input.KeyCode == Enum.KeyCode.B then ToggleAutoGun()
-    elseif input.KeyCode == Enum.KeyCode.N then ToggleAutoTeleport() end
+    local keyName = input.KeyCode.Name
+    local function matchesFlag(flag)
+        local bound = tostring(Flags[flag] or ""):upper()
+        return keyName:upper() == bound
+    end
+    if matchesFlag("SwingKeybind") then ToggleAutoSwing()
+    elseif matchesFlag("GunKeybind") then ToggleAutoGun()
+    elseif matchesFlag("SummonKeybind") then ToggleAutoSummon()
+    elseif matchesFlag("TeleportKeybind") then ToggleAutoTeleport() end
 end))
 
 AddConnection(RunService.RenderStepped:Connect(function()
@@ -1345,6 +1536,16 @@ AddConnection(RunService.Heartbeat:Connect(function(dt)
     if Flags.SpeedEnforce and SpeedTimer >= 0.5 then
         SpeedTimer = 0
         ApplyMovementStats()
+    end
+
+    -- Track the last non-summoner weapon the player had equipped (used for post-summon
+    -- restore and for PerformGunAttack fallback). Skipped while IsSummoning so the
+    -- snapshot from before the summon is preserved until the restore fires.
+    if not IsSummoning then
+        local trackedTool = GetEquippedTool()
+        if trackedTool and not IsSummonerTool(trackedTool) and not IsNonCombatTool(trackedTool) then
+            LastPlayerWeapon = trackedTool
+        end
     end
 
     if Flags.AutoSwing and SwingTimer >= Flags.SwingCooldown then
@@ -1370,3 +1571,9 @@ AddConnection(RunService.Heartbeat:Connect(function(dt)
 end))
 
 task.spawn(SetupChatListener)
+
+-- Clear the tracked weapon reference when the character respawns so stale
+-- references from the previous life don't cause equip errors.
+AddConnection(LocalPlayer.CharacterAdded:Connect(function()
+    LastPlayerWeapon = nil
+end))
