@@ -232,16 +232,58 @@ local function IsNonCombatTool(tool)
     return false
 end
 
+-- Returns true if the tool is a ranged/gun weapon.
+-- Uses all known Craftwars gun indicators so that RF-only guns (cannons etc.)
+-- are correctly identified even when they have no RemoteEvent.
+local function IsRangedWeapon(tool)
+    if not tool then return false end
+    -- RemoteEvent is the primary marker for standard guns
+    if tool:FindFirstChild("RemoteEvent") then return true end
+    -- Craftwars-specific ranged components
+    if tool:FindFirstChild("GunThrowerMain") then return true end
+    if tool:FindFirstChild("RangedSpread") then return true end
+    if tool:FindFirstChild("RangedPower") then return true end
+    if tool:FindFirstChild("RangedProjectileAmount") then return true end
+    if tool:FindFirstChild("ProjectileSpeed") then return true end
+    if tool:FindFirstChild("Cannonball") then return true end
+    if tool:FindFirstChild("Explosion") then return true end
+    if tool:FindFirstChild("ExplosionDamage") then return true end
+    if tool:FindFirstChild("BlastRadius") then return true end
+    -- Fire-rate / shooting-speed attributes (never appear on melee swords)
+    if tool:FindFirstChild("FireRate") then return true end
+    if tool:FindFirstChild("ShootCooldown") then return true end
+    if tool:FindFirstChild("FireDelay") then return true end
+    if tool:FindFirstChild("ShootSpeed") then return true end
+    if tool:FindFirstChild("RateOfFire") then return true end
+    -- Auto/burst-fire modes
+    if tool:FindFirstChild("AutoFire") then return true end
+    if tool:FindFirstChild("RapidFire") then return true end
+    if tool:FindFirstChild("BurstFire") then return true end
+    if tool:FindFirstChild("Automatic") then return true end
+    if tool:FindFirstChild("FullAuto") then return true end
+    -- Name-based fallback
+    local nameLower = tool.Name:lower()
+    local gunKeywords = {
+        "gun", "rifle", "pistol", "shotgun", "sniper", "revolver", "musket", "flintlock",
+        "cannon", "launcher", "mortar", "rocket", "hydra", "ballista", "catapult", "grenade",
+        "blaster", "smg", "uzi", "minigun", "laser", "beam", "pulse", "plasma",
+        "bow", "crossbow", "ranged",
+    }
+    for _, kw in ipairs(gunKeywords) do
+        if nameLower:find(kw, 1, true) then return true end
+    end
+    return false
+end
+
 local function GetBestMeleeWeapon()
     local best = nil
     local bestDamage = -1
     local function Check(container)
         for _, item in ipairs(container:GetChildren()) do
             if item:IsA("Tool") and not IsSummonerTool(item) and not IsNonCombatTool(item) then
-                -- Pure melee: has RemoteFunction but NOT RemoteEvent (guns have both)
+                -- Pure melee: has RemoteFunction and is NOT a ranged weapon
                 local rf = item:FindFirstChild("RemoteFunction")
-                local re = item:FindFirstChild("RemoteEvent")
-                if rf and not re then
+                if rf and not IsRangedWeapon(item) then
                     local dmgVal = item:FindFirstChild("Damage")
                     local dmg = dmgVal and tonumber(dmgVal.Value) or 0
                     if not best or dmg > bestDamage then
@@ -265,9 +307,8 @@ local function GetBestGunWeapon()
     local function Check(container)
         for _, item in ipairs(container:GetChildren()) do
             if item:IsA("Tool") and not IsSummonerTool(item) and not IsNonCombatTool(item) then
-                -- Guns have a RemoteEvent (may also have RemoteFunction)
-                local re = item:FindFirstChild("RemoteEvent")
-                if re then
+                -- Any ranged weapon: RE, RF-only cannon, GunThrowerMain, etc.
+                if IsRangedWeapon(item) then
                     local dmgVal = item:FindFirstChild("Damage")
                     local dmg = dmgVal and tonumber(dmgVal.Value) or 0
                     if not best or dmg > bestDamage then
@@ -681,11 +722,11 @@ local function PerformSwordAttack()
     if IsSummoning then return end
     local tool = GetEquippedTool()
 
-    -- If no tool equipped or current tool is a summoner, find the best melee weapon to equip
-    if not tool or IsSummonerTool(tool) then
+    -- If no tool equipped, a summoner is equipped, or a ranged weapon is equipped, find the best melee weapon
+    if not tool or IsSummonerTool(tool) or IsRangedWeapon(tool) then
         local best = GetBestMeleeWeapon()
         if best then
-            if GetEquippedTool() ~= best then
+            if tool ~= best then
                 local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
                 if hum then hum:EquipTool(best) end
             end
@@ -715,11 +756,11 @@ local function PerformGunAttack()
     if IsSummoning then return end
     local tool = GetEquippedTool()
 
-    -- Equip the best gun if no tool, a summoner, or a non-gun (no RE) is currently equipped
-    if not tool or IsSummonerTool(tool) or not tool:FindFirstChild("RemoteEvent") then
+    -- Equip the best gun if no tool, a summoner, or a non-ranged (melee) weapon is currently equipped
+    if not tool or IsSummonerTool(tool) or not IsRangedWeapon(tool) then
         local best = GetBestGunWeapon()
         if best then
-            if GetEquippedTool() ~= best then
+            if tool ~= best then
                 local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
                 if hum then hum:EquipTool(best) end
             end
@@ -730,9 +771,10 @@ local function PerformGunAttack()
     if not tool then return end
     if IsSummonerTool(tool) then return end
     if IsNonCombatTool(tool) then return end
-    -- Require a RemoteEvent — this is a gun attack, not a melee attack
+    -- Need at least one firing mechanism
     local re = tool:FindFirstChild("RemoteEvent")
-    if not re then return end
+    local rf = tool:FindFirstChild("RemoteFunction")
+    if not re and not rf then return end
     local target = GetCurrentTarget()
     if not target then return end
     local targetPos = GetEnemyPosition(target)
@@ -742,7 +784,6 @@ local function PerformGunAttack()
     if not char then return end
     local hrp = char:FindFirstChild("HumanoidRootPart")
     if not hrp then return end
-    local rf = tool:FindFirstChild("RemoteFunction")
     local dmgVal = tool:FindFirstChild("Damage")
     local dmg = dmgVal and dmgVal.Value or 20
 
@@ -753,7 +794,9 @@ local function PerformGunAttack()
     local firePos = firePoint and firePoint.Position or hrp.Position
     local aimCF = CFrame.lookAt(firePos, targetPos)
 
-    pcall(function() re:FireServer("hit", {["mhit"] = targetPos}) end)
+    if re then
+        pcall(function() re:FireServer("hit", {["mhit"] = targetPos}) end)
+    end
     if rf then
         pcall(function() rf:InvokeServer("shoot", {aimCF, dmg}) end)
         pcall(function() rf:InvokeServer("shoot", aimCF, dmg) end)
