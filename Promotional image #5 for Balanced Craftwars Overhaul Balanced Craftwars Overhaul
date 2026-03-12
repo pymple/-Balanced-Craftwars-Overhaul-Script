@@ -15,7 +15,7 @@ local Flags = {
     AutoGun = false,
     AutoTeleport = false,
     AutoSummon = false,
-    SmartGunCooldown = true,
+    SmartGunCooldown = false,
     EnemyESP = false,
     AllyESP = false,
     TeleportPosition = "Back",
@@ -33,6 +33,10 @@ local Flags = {
 local SwingTimer, GunTimer, SpeedTimer, SummonTimer = 0, 0, 0, 0
 local CurrentTarget = nil
 local LastEquippedWeapon = nil
+-- The last non-summoner, non-combat tool the player personally had equipped.
+-- Updated every heartbeat (when not summoning) so post-summon restore always
+-- returns to whichever weapon the player was using before.
+local LastPlayerWeapon = nil
 local IsSummoning = false
 local KillCount = 0
 local SessionStartTime = tick()
@@ -110,6 +114,11 @@ end
 local function ToggleAutoTeleport()
     Flags.AutoTeleport = not Flags.AutoTeleport
     UpdateToggleState(AutoTeleportToggle, Flags.AutoTeleport)
+end
+
+local function ToggleAutoSummon()
+    Flags.AutoSummon = not Flags.AutoSummon
+    UpdateToggleState(AutoSummonToggle, Flags.AutoSummon)
 end
 
 local function ApplyMovementStats()
@@ -337,6 +346,15 @@ EquipBestWeaponForMode = function()
     local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
     if not hum then return end
     if Flags.AutoGun then
+        -- Prefer the weapon the player was last using (most reliable — avoids mis-classification)
+        if LastPlayerWeapon then
+            local parent = LastPlayerWeapon.Parent
+            if parent == LocalPlayer:FindFirstChild("Backpack") or parent == LocalPlayer.Character then
+                hum:EquipTool(LastPlayerWeapon)
+                return
+            end
+        end
+        -- Fallback: best-guess search
         local best = GetBestGunWeapon()
         if best then hum:EquipTool(best) end
     elseif Flags.AutoSwing then
@@ -420,13 +438,24 @@ local function ActivateSummonerTool(tool)
         pcall(function() re:FireServer("hit", {80, 1}) end)
     end
 
-    -- Re-equip the correct weapon 0.5s after summoning (live reference, not name lookup),
-    -- then clear IsSummoning 0.15s later to give the equip animation time to settle.
+    -- Re-equip the weapon the player was using before we switched to the summoner.
+    -- LastPlayerWeapon is kept current by the heartbeat loop and won't be updated
+    -- while IsSummoning is true, so it still points to the pre-summon weapon here.
     task.delay(0.5, function()
         local hum2 = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
         if hum2 then
-            local bestWeapon = Flags.AutoGun and GetBestGunWeapon() or GetBestMeleeWeapon()
-            if bestWeapon then hum2:EquipTool(bestWeapon) end
+            local restored = false
+            if LastPlayerWeapon then
+                local parent = LastPlayerWeapon.Parent
+                if parent == LocalPlayer:FindFirstChild("Backpack") or parent == LocalPlayer.Character then
+                    hum2:EquipTool(LastPlayerWeapon)
+                    restored = true
+                end
+            end
+            if not restored then
+                local bestWeapon = Flags.AutoGun and GetBestGunWeapon() or GetBestMeleeWeapon()
+                if bestWeapon then hum2:EquipTool(bestWeapon) end
+            end
         end
     end)
     task.delay(0.65, function()
@@ -526,16 +555,14 @@ local function ClassifyWeapon(tool)
 end
 
 local function GetEffectiveGunCooldown()
-    -- Gun Cooldown slider is always respected:
-    -- • Smart Cooldown ON  → weapon's detected rate is a floor (never fires faster than
-    --                         the weapon supports), but the slider can still slow firing
-    --                         down by setting a higher cooldown value.
-    -- • Smart Cooldown OFF → slider value is used directly with no floor.
+    -- Smart Cooldown ON  → use the weapon's own detected fire rate (ignores slider;
+    --                       turn Smart Cooldown OFF to use the slider directly).
+    -- Smart Cooldown OFF → use the Gun Cooldown slider value exactly.
     if Flags.SmartGunCooldown then
         local tool = GetEquippedTool()
         if tool then
             local _, weaponCd = ClassifyWeapon(tool)
-            return math.max(weaponCd, Flags.GunCooldown)
+            return weaponCd
         end
     end
     return Flags.GunCooldown
@@ -766,15 +793,29 @@ local function PerformGunAttack()
     if IsSummoning then return end
     local tool = GetEquippedTool()
 
-    -- Equip the best gun if no tool is equipped, or if a summoner/melee is equipped
+    -- If no valid ranged weapon is equipped, try to equip one.
+    -- Priority: (1) last weapon the player was using, (2) best-guess search.
     if not tool or IsSummonerTool(tool) or not IsRangedWeapon(tool) then
-        local best = GetBestGunWeapon()
-        if best then
-            if tool ~= best then
-                local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
-                if hum then hum:EquipTool(best) end
+        local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+        local candidate = nil
+
+        -- Try the weapon tracked from the player's own equip history
+        if LastPlayerWeapon then
+            local parent = LastPlayerWeapon.Parent
+            if (parent == LocalPlayer:FindFirstChild("Backpack") or parent == LocalPlayer.Character)
+                and IsRangedWeapon(LastPlayerWeapon) then
+                candidate = LastPlayerWeapon
             end
-            tool = best
+        end
+
+        -- Fall back to searching the inventory
+        if not candidate then
+            candidate = GetBestGunWeapon()
+        end
+
+        if candidate and hum then
+            if tool ~= candidate then hum:EquipTool(candidate) end
+            tool = candidate
         end
     end
 
@@ -1151,7 +1192,7 @@ Window.OnToggle = function(visible) UIOpen = visible end
 
 Notifier.new({
     Title = "pimpleHUB Loaded",
-    Content = "Left Alt = UI | V = Swing | B = Gun\nN = Teleport",
+    Content = "Left Alt = UI | V = Swing | B = Gun | G = Summon\nN = Teleport",
     Duration = 5,
     Icon = AVATAR_ICON
 })
@@ -1204,7 +1245,8 @@ AutoSummonToggle = KillAuraSection:AddToggle({
     Name = "Auto Summon", Flag = "AutoSummon", Default = false,
     Callback = function(v) Flags.AutoSummon = v end
 })
-AutoSummonToggle.Link:AddHelper({Text = "Uses summon items auto"})
+AutoSummonToggle.Link:AddKeybind({Default = "G", Flag = "SummonKeybind", Callback = ToggleAutoSummon})
+AutoSummonToggle.Link:AddHelper({Text = "Uses summon items automatically (G to toggle)"})
 
 EnemyESPToggle = KillAuraSection:AddToggle({
     Name = "Enemy ESP", Flag = "EnemyESP", Default = false,
@@ -1249,10 +1291,10 @@ SpeedSection:AddSlider({
 })
 
 SmartCooldownToggle = SpeedSection:AddToggle({
-    Name = "Smart Cooldown", Flag = "SmartGunCooldown", Default = true,
+    Name = "Smart Cooldown", Flag = "SmartGunCooldown", Default = false,
     Callback = function(v) Flags.SmartGunCooldown = v end
 })
-SmartCooldownToggle.Link:AddHelper({Text = "Auto fire rate per weapon"})
+SmartCooldownToggle.Link:AddHelper({Text = "Uses weapon's own fire rate (overrides slider when ON)"})
 
 SpeedSection:AddButton({
     Name = "Weapon Stats",
@@ -1467,7 +1509,7 @@ UISettings:AddButton({
 local InfoSection = SettingsTab:DrawSection({Name = "Info", Position = "right"})
 InfoSection:AddParagraph({
     Title = "pimpleHUB v6.0",
-    Content = "Balanced Craftwars Script\n\nKeybinds:\nLeft Alt - Toggle UI\nV - Auto Swing\nB - Auto Gun\nN - Auto Teleport"
+    Content = "Balanced Craftwars Script\n\nKeybinds:\nLeft Alt - Toggle UI\nV - Auto Swing\nB - Auto Gun\nG - Auto Summon\nN - Auto Teleport"
 })
 
 local ThemeSettings = ThemesTab:DrawSection({Name = "UI Themes", Position = "left"})
@@ -1484,6 +1526,7 @@ AddConnection(UserInputService.InputBegan:Connect(function(input, gameProcessed)
     if gameProcessed or IsTyping() then return end
     if input.KeyCode == Enum.KeyCode.V then ToggleAutoSwing()
     elseif input.KeyCode == Enum.KeyCode.B then ToggleAutoGun()
+    elseif input.KeyCode == Enum.KeyCode.G then ToggleAutoSummon()
     elseif input.KeyCode == Enum.KeyCode.N then ToggleAutoTeleport() end
 end))
 
@@ -1501,6 +1544,16 @@ AddConnection(RunService.Heartbeat:Connect(function(dt)
     if Flags.SpeedEnforce and SpeedTimer >= 0.5 then
         SpeedTimer = 0
         ApplyMovementStats()
+    end
+
+    -- Track the last non-summoner weapon the player had equipped (used for post-summon
+    -- restore and for PerformGunAttack fallback). Skipped while IsSummoning so the
+    -- snapshot from before the summon is preserved until the restore fires.
+    if not IsSummoning then
+        local trackedTool = GetEquippedTool()
+        if trackedTool and not IsSummonerTool(trackedTool) and not IsNonCombatTool(trackedTool) then
+            LastPlayerWeapon = trackedTool
+        end
     end
 
     if Flags.AutoSwing and SwingTimer >= Flags.SwingCooldown then
@@ -1526,3 +1579,9 @@ AddConnection(RunService.Heartbeat:Connect(function(dt)
 end))
 
 task.spawn(SetupChatListener)
+
+-- Clear the tracked weapon reference when the character respawns so stale
+-- references from the previous life don't cause equip errors.
+AddConnection(LocalPlayer.CharacterAdded:Connect(function()
+    LastPlayerWeapon = nil
+end))
