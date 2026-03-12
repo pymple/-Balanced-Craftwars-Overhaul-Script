@@ -84,11 +84,19 @@ end
 
 local function ToggleAutoSwing()
     Flags.AutoSwing = not Flags.AutoSwing
+    if Flags.AutoSwing and Flags.AutoGun then
+        Flags.AutoGun = false
+        UpdateToggleState(AutoGunToggle, false)
+    end
     UpdateToggleState(AutoSwingToggle, Flags.AutoSwing)
 end
 
 local function ToggleAutoGun()
     Flags.AutoGun = not Flags.AutoGun
+    if Flags.AutoGun and Flags.AutoSwing then
+        Flags.AutoSwing = false
+        UpdateToggleState(AutoSwingToggle, false)
+    end
     UpdateToggleState(AutoGunToggle, Flags.AutoGun)
 end
 
@@ -293,7 +301,7 @@ local function ActivateSummonerTool(tool)
         task.delay(0.3, function()
             EquipWeaponByName(previousWeapon)
         end)
-    elseif LastEquippedWeapon and not IsSummonerTool(tool) == false then
+    elseif LastEquippedWeapon then
         task.delay(0.3, function()
             EquipWeaponByName(LastEquippedWeapon)
         end)
@@ -606,6 +614,37 @@ end
 
 local function PerformSwordAttack()
     local tool = GetEquippedTool()
+
+    -- If no tool equipped or current tool is a summoner, find a melee weapon to equip
+    if not tool or IsSummonerTool(tool) then
+        local backpack = LocalPlayer:FindFirstChild("Backpack")
+        if backpack then
+            -- First pass: prefer melee weapons (has RF but no RE)
+            for _, item in ipairs(backpack:GetChildren()) do
+                if item:IsA("Tool") and not IsSummonerTool(item) then
+                    local rf = item:FindFirstChild("RemoteFunction")
+                    if rf and not item:FindFirstChild("RemoteEvent") then
+                        local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+                        if hum then hum:EquipTool(item) end
+                        tool = item
+                        break
+                    end
+                end
+            end
+            -- Fallback: equip any non-summoner tool with a RemoteFunction
+            if not tool or IsSummonerTool(tool) then
+                for _, item in ipairs(backpack:GetChildren()) do
+                    if item:IsA("Tool") and not IsSummonerTool(item) and item:FindFirstChild("RemoteFunction") then
+                        local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+                        if hum then hum:EquipTool(item) end
+                        tool = item
+                        break
+                    end
+                end
+            end
+        end
+    end
+
     if not tool then return end
     if IsSummonerTool(tool) then return end
     local rf = tool:FindFirstChild("RemoteFunction")
@@ -626,6 +665,37 @@ end
 
 local function PerformGunAttack()
     local tool = GetEquippedTool()
+
+    -- If no tool equipped or current tool is a summoner, find a gun to equip
+    if not tool or IsSummonerTool(tool) then
+        local backpack = LocalPlayer:FindFirstChild("Backpack")
+        if backpack then
+            -- First pass: prefer guns (has RemoteEvent)
+            for _, item in ipairs(backpack:GetChildren()) do
+                if item:IsA("Tool") and not IsSummonerTool(item) then
+                    local re = item:FindFirstChild("RemoteEvent")
+                    if re then
+                        local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+                        if hum then hum:EquipTool(item) end
+                        tool = item
+                        break
+                    end
+                end
+            end
+            -- Fallback: equip any non-summoner tool
+            if not tool or IsSummonerTool(tool) then
+                for _, item in ipairs(backpack:GetChildren()) do
+                    if item:IsA("Tool") and not IsSummonerTool(item) then
+                        local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+                        if hum then hum:EquipTool(item) end
+                        tool = item
+                        break
+                    end
+                end
+            end
+        end
+    end
+
     if not tool then return end
     if IsSummonerTool(tool) then return end
     local target = GetCurrentTarget()
@@ -1032,14 +1102,26 @@ local KillAuraSection = CombatTab:DrawSection({Name = "Kill Aura", Position = "l
 
 AutoSwingToggle = KillAuraSection:AddToggle({
     Name = "Auto Swing", Flag = "AutoSwing", Default = false,
-    Callback = function(v) Flags.AutoSwing = v end
+    Callback = function(v)
+        Flags.AutoSwing = v
+        if v and Flags.AutoGun then
+            Flags.AutoGun = false
+            UpdateToggleState(AutoGunToggle, false)
+        end
+    end
 })
 AutoSwingToggle.Link:AddKeybind({Default = "V", Flag = "SwingKeybind", Callback = ToggleAutoSwing})
 AutoSwingToggle.Link:AddHelper({Text = "Melee: RF 'hit'"})
 
 AutoGunToggle = KillAuraSection:AddToggle({
     Name = "Auto Gun", Flag = "AutoGun", Default = false,
-    Callback = function(v) Flags.AutoGun = v end
+    Callback = function(v)
+        Flags.AutoGun = v
+        if v and Flags.AutoSwing then
+            Flags.AutoSwing = false
+            UpdateToggleState(AutoSwingToggle, false)
+        end
+    end
 })
 AutoGunToggle.Link:AddKeybind({Default = "B", Flag = "GunKeybind", Callback = ToggleAutoGun})
 AutoGunToggle.Link:AddHelper({Text = "All guns: RE + RF"})
