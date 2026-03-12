@@ -238,28 +238,45 @@ local function IsNonCombatTool(tool)
 end
 
 -- Returns true if the tool is a ranged/gun weapon.
--- Key rule from game remotes:
---   Guns  → RE:FireServer("hit", {mhit=Vector3})  — have RemoteEvent, NO RemoteFunction
---   Swords → RF:InvokeServer("hit", {dmg, 1})      — always have RemoteFunction
--- Therefore: if a tool has RemoteFunction it is a melee/sword (even if it also has RemoteEvent).
--- Only tools with RemoteEvent and NO RemoteFunction are guns.
+-- Classification priority (highest to lowest):
+--  1. Explicit gun-attribute children  → always ranged
+--  2. RE only, no RF                   → ranged (gun fires via RE)
+--  3. RF only, no RE                   → melee (sword fires via RF)
+--  4. Both RE + RF                     → check name; sword keywords → melee, else → ranged
+--     (Craftwars guns commonly carry both remotes; the old "RF = always melee" rule was wrong)
+local SWORD_NAME_KEYWORDS = {"sword", "blade", "katana", "saber", "sabre", "axe", "hammer",
+    "mace", "club", "dagger", "knife", "lance", "spear", "scythe", "cleaver",
+    "excalibur", "falchion", "rapier", "halberd", "partisan", "glaive"}
 local function IsRangedWeapon(tool)
     if not tool then return false end
-    -- Presence of RemoteFunction means this is a melee/sword weapon
-    if tool:FindFirstChild("RemoteFunction") then return false end
-    -- Pure gun: has RemoteEvent and no RemoteFunction
-    if tool:FindFirstChild("RemoteEvent") then return true end
-    -- Edge-case ranged components (RE-less specialty ranged items)
-    if tool:FindFirstChild("GunThrowerMain") then return true end
-    if tool:FindFirstChild("RangedSpread") then return true end
-    if tool:FindFirstChild("RangedPower") then return true end
-    if tool:FindFirstChild("RangedProjectileAmount") then return true end
-    if tool:FindFirstChild("ProjectileSpeed") then return true end
-    if tool:FindFirstChild("FireRate") then return true end
-    if tool:FindFirstChild("ShootCooldown") then return true end
-    if tool:FindFirstChild("FireDelay") then return true end
-    if tool:FindFirstChild("ShootSpeed") then return true end
-    if tool:FindFirstChild("RateOfFire") then return true end
+    -- Gun-specific attribute children always indicate a ranged weapon
+    if tool:FindFirstChild("GunThrowerMain")        then return true end
+    if tool:FindFirstChild("RangedSpread")          then return true end
+    if tool:FindFirstChild("RangedPower")           then return true end
+    if tool:FindFirstChild("RangedProjectileAmount")then return true end
+    if tool:FindFirstChild("ProjectileSpeed")       then return true end
+    if tool:FindFirstChild("FireRate")              then return true end
+    if tool:FindFirstChild("ShootCooldown")         then return true end
+    if tool:FindFirstChild("FireDelay")             then return true end
+    if tool:FindFirstChild("ShootSpeed")            then return true end
+    if tool:FindFirstChild("RateOfFire")            then return true end
+
+    local hasRE = tool:FindFirstChild("RemoteEvent")   ~= nil
+    local hasRF = tool:FindFirstChild("RemoteFunction") ~= nil
+
+    if hasRF and not hasRE then return false end  -- RF-only → definitively melee
+    if hasRE and not hasRF then return true  end  -- RE-only → definitively ranged
+
+    -- Both RE + RF: use sword name keywords; if none match, treat as ranged
+    -- (Gun attack fires via RE — having RE is the primary ranged signal)
+    if hasRE and hasRF then
+        local nameLower = tool.Name:lower()
+        for _, kw in ipairs(SWORD_NAME_KEYWORDS) do
+            if nameLower:find(kw, 1, true) then return false end
+        end
+        return true
+    end
+
     return false
 end
 
@@ -509,11 +526,19 @@ local function ClassifyWeapon(tool)
 end
 
 local function GetEffectiveGunCooldown()
-    if not Flags.SmartGunCooldown then return Flags.GunCooldown end
-    local tool = GetEquippedTool()
-    if not tool then return Flags.GunCooldown end
-    local _, cd = ClassifyWeapon(tool)
-    return cd
+    -- Gun Cooldown slider is always respected:
+    -- • Smart Cooldown ON  → weapon's detected rate is a floor (never fires faster than
+    --                         the weapon supports), but the slider can still slow firing
+    --                         down by setting a higher cooldown value.
+    -- • Smart Cooldown OFF → slider value is used directly with no floor.
+    if Flags.SmartGunCooldown then
+        local tool = GetEquippedTool()
+        if tool then
+            local _, weaponCd = ClassifyWeapon(tool)
+            return math.max(weaponCd, Flags.GunCooldown)
+        end
+    end
+    return Flags.GunCooldown
 end
 
 local function GetWeaponStats()
@@ -1159,7 +1184,7 @@ AutoSwingToggle = KillAuraSection:AddToggle({
     end
 })
 AutoSwingToggle.Link:AddKeybind({Default = "V", Flag = "SwingKeybind", Callback = ToggleAutoSwing})
-AutoSwingToggle.Link:AddHelper({Text = "Swords (RF): equips best sword for visibility, fires via RF"})
+AutoSwingToggle.Link:AddHelper({Text = "Swords: equips best sword, attacks fire via RemoteFunction"})
 
 AutoGunToggle = KillAuraSection:AddToggle({
     Name = "Auto Gun", Flag = "AutoGun", Default = false,
@@ -1173,7 +1198,7 @@ AutoGunToggle = KillAuraSection:AddToggle({
     end
 })
 AutoGunToggle.Link:AddKeybind({Default = "B", Flag = "GunKeybind", Callback = ToggleAutoGun})
-AutoGunToggle.Link:AddHelper({Text = "Guns (RE only, no RF): equips best gun immediately"})
+AutoGunToggle.Link:AddHelper({Text = "Guns: equips best gun (detected by RE, gun attrs, or name)"})
 
 AutoSummonToggle = KillAuraSection:AddToggle({
     Name = "Auto Summon", Flag = "AutoSummon", Default = false,
