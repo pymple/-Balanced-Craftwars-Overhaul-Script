@@ -17,6 +17,7 @@ local Flags = {
     AutoSummon = false,
     SmartGunCooldown = true,
     EnemyESP = false,
+    AllyESP = false,
     TeleportPosition = "Back",
     TeleportDistance = 5,
     TargetPriority = "Nearest",
@@ -35,7 +36,7 @@ local LastEquippedWeapon = nil
 local KillCount = 0
 local SessionStartTime = tick()
 local pimpleHUB, Notifier, Window, ConfigManager
-local AutoSwingToggle, AutoGunToggle, AutoTeleportToggle, SmartCooldownToggle, EnemyESPToggle, AutoSummonToggle = nil, nil, nil, nil, nil, nil
+local AutoSwingToggle, AutoGunToggle, AutoTeleportToggle, SmartCooldownToggle, EnemyESPToggle, AllyESPToggle, AutoSummonToggle = nil, nil, nil, nil, nil, nil, nil
 local UIOpen = true
 
 local MAX_ITEMS = 50
@@ -693,7 +694,7 @@ local function CreateESP(model, espType)
         outlineColor = Color3.fromRGB(255, 50, 50)
     else
         nameColor = Color3.fromRGB(255, 80, 80)
-        hpColor = Color3.fromRGB(255, 150, 100)
+        hpColor = Color3.fromRGB(255, 80, 80)
         fillColor = Color3.fromRGB(200, 0, 0)
         outlineColor = Color3.fromRGB(255, 80, 80)
     end
@@ -741,7 +742,7 @@ local function CreateESP(model, espType)
     ESPObjects[model] = billboard
 
     task.spawn(function()
-        while model and model.Parent and Flags.EnemyESP do
+        while model and model.Parent and ((espType == "enemy" and Flags.EnemyESP) or (espType == "summon" and Flags.AllyESP)) do
             local hum = model:FindFirstChildOfClass("Humanoid")
             if hum then
                 hpLabel.Text = math.floor(hum.Health) .. "/" .. math.floor(hum.MaxHealth)
@@ -758,14 +759,18 @@ local function CreateESP(model, espType)
 end
 
 local function UpdateESP()
-    if not Flags.EnemyESP then ClearESP() return end
-    local enemies = GetAllEnemies()
-    for _, enemy in ipairs(enemies) do
-        CreateESP(enemy, "enemy")
+    if not Flags.EnemyESP and not Flags.AllyESP then ClearESP() return end
+    if Flags.EnemyESP then
+        local enemies = GetAllEnemies()
+        for _, enemy in ipairs(enemies) do
+            CreateESP(enemy, "enemy")
+        end
     end
-    local summons = GetAllSummons()
-    for _, summon in ipairs(summons) do
-        CreateESP(summon, "summon")
+    if Flags.AllyESP then
+        local summons = GetAllSummons()
+        for _, summon in ipairs(summons) do
+            CreateESP(summon, "summon")
+        end
     end
 end
 
@@ -1049,10 +1054,19 @@ EnemyESPToggle = KillAuraSection:AddToggle({
     Name = "Enemy ESP", Flag = "EnemyESP", Default = false,
     Callback = function(v)
         Flags.EnemyESP = v
-        if not v then ClearESP() end
+        if not v and not Flags.AllyESP then ClearESP() end
     end
 })
-EnemyESPToggle.Link:AddHelper({Text = "Red=enemy Green=summon"})
+EnemyESPToggle.Link:AddHelper({Text = "Red highlight on enemies"})
+
+AllyESPToggle = KillAuraSection:AddToggle({
+    Name = "Ally ESP", Flag = "AllyESP", Default = false,
+    Callback = function(v)
+        Flags.AllyESP = v
+        if not v and not Flags.EnemyESP then ClearESP() end
+    end
+})
+AllyESPToggle.Link:AddHelper({Text = "Green highlight on summons"})
 
 KillAuraSection:AddDropdown({
     Name = "Target Priority", Default = Flags.TargetPriority,
@@ -1344,7 +1358,7 @@ AddConnection(RunService.Heartbeat:Connect(function(dt)
         task.spawn(PerformGunAttack)
     end
 
-    if Flags.EnemyESP and ESPTimer >= 2 then
+    if (Flags.EnemyESP or Flags.AllyESP) and ESPTimer >= 2 then
         ESPTimer = 0
         task.spawn(UpdateESP)
     end
