@@ -33,6 +33,7 @@ local Flags = {
 local SwingTimer, GunTimer, SpeedTimer, SummonTimer = 0, 0, 0, 0
 local CurrentTarget = nil
 local LastEquippedWeapon = nil
+local IsSummoning = false
 local KillCount = 0
 local SessionStartTime = tick()
 local pimpleHUB, Notifier, Window, ConfigManager
@@ -231,6 +232,31 @@ local function IsNonCombatTool(tool)
     return false
 end
 
+local function GetBestMeleeWeapon()
+    local best = nil
+    local bestDamage = -1
+    local function Check(container)
+        for _, item in ipairs(container:GetChildren()) do
+            if item:IsA("Tool") and not IsSummonerTool(item) and not IsNonCombatTool(item) then
+                local rf = item:FindFirstChild("RemoteFunction")
+                if rf then
+                    local dmgVal = item:FindFirstChild("Damage")
+                    local dmg = dmgVal and tonumber(dmgVal.Value) or 0
+                    if not best or dmg > bestDamage then
+                        bestDamage = dmg
+                        best = item
+                    end
+                end
+            end
+        end
+    end
+    local backpack = LocalPlayer:FindFirstChild("Backpack")
+    if backpack then Check(backpack) end
+    local char = LocalPlayer.Character
+    if char then Check(char) end
+    return best
+end
+
 local function GetSummonerFromBackpack()
     local backpack = LocalPlayer:FindFirstChild("Backpack")
     if backpack then
@@ -287,13 +313,9 @@ local function ActivateSummonerTool(tool)
     local hum = char:FindFirstChildOfClass("Humanoid")
     if not hum then return end
 
-    local currentTool = GetEquippedTool()
-    local previousWeapon = nil
-    if currentTool and currentTool ~= tool and not IsSummonerTool(currentTool) and not IsNonCombatTool(currentTool) then
-        previousWeapon = currentTool.Name
-    end
+    IsSummoning = true
 
-    if currentTool ~= tool then
+    if GetEquippedTool() ~= tool then
         hum:EquipTool(tool)
         task.wait(0.15)
     end
@@ -310,15 +332,17 @@ local function ActivateSummonerTool(tool)
         pcall(function() re:FireServer("hit", {80, 1}) end)
     end
 
-    if previousWeapon then
-        task.delay(0.3, function()
-            EquipWeaponByName(previousWeapon)
-        end)
-    elseif LastEquippedWeapon then
-        task.delay(0.3, function()
+    task.delay(0.5, function()
+        local bestMelee = GetBestMeleeWeapon()
+        if bestMelee then
+            EquipWeaponByName(bestMelee.Name)
+        elseif LastEquippedWeapon then
             EquipWeaponByName(LastEquippedWeapon)
+        end
+        task.delay(0.15, function()
+            IsSummoning = false
         end)
-    end
+    end)
 end
 
 local function TryAutoSummon()
@@ -626,35 +650,18 @@ local function TeleportToTarget()
 end
 
 local function PerformSwordAttack()
+    if IsSummoning then return end
     local tool = GetEquippedTool()
 
-    -- If no tool equipped or current tool is a summoner, find a melee weapon to equip
+    -- If no tool equipped or current tool is a summoner, find the best melee weapon to equip
     if not tool or IsSummonerTool(tool) then
-        local backpack = LocalPlayer:FindFirstChild("Backpack")
-        if backpack then
-            -- First pass: prefer melee weapons (has RF but no RE)
-            for _, item in ipairs(backpack:GetChildren()) do
-                if item:IsA("Tool") and not IsSummonerTool(item) and not IsNonCombatTool(item) then
-                    local rf = item:FindFirstChild("RemoteFunction")
-                    if rf and not item:FindFirstChild("RemoteEvent") then
-                        local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
-                        if hum then hum:EquipTool(item) end
-                        tool = item
-                        break
-                    end
-                end
+        local best = GetBestMeleeWeapon()
+        if best then
+            if GetEquippedTool() ~= best then
+                local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+                if hum then hum:EquipTool(best) end
             end
-            -- Fallback: equip any non-summoner combat tool with a RemoteFunction
-            if not tool or IsSummonerTool(tool) then
-                for _, item in ipairs(backpack:GetChildren()) do
-                    if item:IsA("Tool") and not IsSummonerTool(item) and not IsNonCombatTool(item) and item:FindFirstChild("RemoteFunction") then
-                        local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
-                        if hum then hum:EquipTool(item) end
-                        tool = item
-                        break
-                    end
-                end
-            end
+            tool = best
         end
     end
 
@@ -677,6 +684,7 @@ local function GetToolFirePoint(tool)
 end
 
 local function PerformGunAttack()
+    if IsSummoning then return end
     local tool = GetEquippedTool()
 
     -- If no tool equipped or current tool is a summoner, find a gun to equip
@@ -696,7 +704,7 @@ local function PerformGunAttack()
                 end
             end
             -- Fallback: equip any non-summoner combat tool with RemoteFunction
-            if not tool or IsSummonerTool(tool) then
+            if not tool then
                 for _, item in ipairs(backpack:GetChildren()) do
                     if item:IsA("Tool") and not IsSummonerTool(item) and not IsNonCombatTool(item) and item:FindFirstChild("RemoteFunction") then
                         local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
