@@ -28,6 +28,10 @@ local Flags = {
     JumpPower = 50,
     AutoReequip = true,
     SpeedEnforce = true,
+    SwingKeybind = "V",
+    GunKeybind = "B",
+    SummonKeybind = "G",
+    TeleportKeybind = "N",
 }
 
 local SwingTimer, GunTimer, SpeedTimer, SummonTimer = 0, 0, 0, 0
@@ -747,14 +751,25 @@ end
 
 local function PerformSwordAttack()
     if IsSummoning then return end
-    -- Swords fire via RF:InvokeServer("hit", {dmg, 1}).
-    -- GetBestMeleeWeapon searches both backpack and character, so this works whether
-    -- the sword is equipped (in Character) or sitting in the Backpack.
-    local tool = GetBestMeleeWeapon()
+    if not GetCurrentTarget() then return end
+
+    -- Prefer the currently equipped tool: if the player manually equipped a sword
+    -- (or any tool with a RemoteFunction), fire it directly without any classification.
+    local tool = nil
+    local equipped = GetEquippedTool()
+    if equipped and not IsSummonerTool(equipped) and not IsNonCombatTool(equipped)
+        and equipped:FindFirstChild("RemoteFunction") then
+        tool = equipped
+    end
+
+    -- Fall back to the best classified melee weapon found in backpack/character.
+    if not tool then
+        tool = GetBestMeleeWeapon()
+    end
+
     if not tool then return end
     local rf = tool:FindFirstChild("RemoteFunction")
     if not rf then return end
-    if not GetCurrentTarget() then return end
     local dmgVal = tool:FindFirstChild("Damage")
     local dmg = dmgVal and tonumber(dmgVal.Value) or 80
     LastEquippedWeapon = tool.Name
@@ -1197,7 +1212,7 @@ AutoSwingToggle = KillAuraSection:AddToggle({
         end
     end
 })
-AutoSwingToggle.Link:AddKeybind({Default = "V", Flag = "SwingKeybind", Callback = ToggleAutoSwing})
+AutoSwingToggle.Link:AddKeybind({Default = "V", Flag = "SwingKeybind", Callback = function() end})
 AutoSwingToggle.Link:AddHelper({Text = "Fires melee weapon RF without switching your equipped slot"})
 
 AutoGunToggle = KillAuraSection:AddToggle({
@@ -1210,15 +1225,15 @@ AutoGunToggle = KillAuraSection:AddToggle({
         end
     end
 })
-AutoGunToggle.Link:AddKeybind({Default = "B", Flag = "GunKeybind", Callback = ToggleAutoGun})
+AutoGunToggle.Link:AddKeybind({Default = "B", Flag = "GunKeybind", Callback = function() end})
 AutoGunToggle.Link:AddHelper({Text = "Fires gun RE without switching your equipped slot"})
 
 AutoSummonToggle = KillAuraSection:AddToggle({
     Name = "Auto Summon", Flag = "AutoSummon", Default = false,
     Callback = function(v) Flags.AutoSummon = v end
 })
-AutoSummonToggle.Link:AddKeybind({Default = "G", Flag = "SummonKeybind", Callback = ToggleAutoSummon})
-AutoSummonToggle.Link:AddHelper({Text = "Uses summon items automatically (G to toggle)"})
+AutoSummonToggle.Link:AddKeybind({Default = "G", Flag = "SummonKeybind", Callback = function() end})
+AutoSummonToggle.Link:AddHelper({Text = "Uses summon items automatically"})
 
 EnemyESPToggle = KillAuraSection:AddToggle({
     Name = "Enemy ESP", Flag = "EnemyESP", Default = false,
@@ -1304,8 +1319,8 @@ AutoTeleportToggle = TeleportSection:AddToggle({
     Name = "Auto Teleport", Flag = "AutoTeleport", Default = false,
     Callback = function(v) Flags.AutoTeleport = v end
 })
-AutoTeleportToggle.Link:AddKeybind({Default = "N", Flag = "TeleportKeybind", Callback = ToggleAutoTeleport})
-AutoTeleportToggle.Link:AddHelper({Text = "Press N to toggle"})
+AutoTeleportToggle.Link:AddKeybind({Default = "N", Flag = "TeleportKeybind", Callback = function() end})
+AutoTeleportToggle.Link:AddHelper({Text = "Teleports next to your target (keybind remappable)"})
 
 TeleportSection:AddDropdown({
     Name = "Position", Default = Flags.TeleportPosition,
@@ -1481,7 +1496,7 @@ UISettings:AddButton({
 local InfoSection = SettingsTab:DrawSection({Name = "Info", Position = "right"})
 InfoSection:AddParagraph({
     Title = "pimpleHUB v6.0",
-    Content = "Balanced Craftwars Script\n\nKeybinds:\nLeft Alt - Toggle UI\nV - Auto Swing\nB - Auto Gun\nG - Auto Summon\nN - Auto Teleport"
+    Content = "Balanced Craftwars Script\n\nKeybinds are remappable in the UI.\nLeft Alt - Toggle UI\nDefaults: V - Auto Swing, B - Auto Gun\nG - Auto Summon, N - Auto Teleport"
 })
 
 local ThemeSettings = ThemesTab:DrawSection({Name = "UI Themes", Position = "left"})
@@ -1496,10 +1511,15 @@ ConfigUI:Init()
 
 AddConnection(UserInputService.InputBegan:Connect(function(input, gameProcessed)
     if gameProcessed or IsTyping() then return end
-    if input.KeyCode == Enum.KeyCode.V then ToggleAutoSwing()
-    elseif input.KeyCode == Enum.KeyCode.B then ToggleAutoGun()
-    elseif input.KeyCode == Enum.KeyCode.G then ToggleAutoSummon()
-    elseif input.KeyCode == Enum.KeyCode.N then ToggleAutoTeleport() end
+    local keyName = input.KeyCode.Name
+    local function matchesFlag(flag)
+        local bound = tostring(Flags[flag] or ""):upper()
+        return keyName:upper() == bound
+    end
+    if matchesFlag("SwingKeybind") then ToggleAutoSwing()
+    elseif matchesFlag("GunKeybind") then ToggleAutoGun()
+    elseif matchesFlag("SummonKeybind") then ToggleAutoSummon()
+    elseif matchesFlag("TeleportKeybind") then ToggleAutoTeleport() end
 end))
 
 AddConnection(RunService.RenderStepped:Connect(function()
