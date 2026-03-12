@@ -39,6 +39,9 @@ local SessionStartTime = tick()
 local pimpleHUB, Notifier, Window, ConfigManager
 local AutoSwingToggle, AutoGunToggle, AutoTeleportToggle, SmartCooldownToggle, EnemyESPToggle, AllyESPToggle, AutoSummonToggle = nil, nil, nil, nil, nil, nil, nil
 local UIOpen = true
+-- Forward declaration: assigned after GetBestGunWeapon/GetBestMeleeWeapon are defined below.
+-- Equips the best weapon for the currently active auto-attack mode immediately.
+local EquipBestWeaponForMode
 
 local MAX_ITEMS = 50
 local NON_COMBAT_KEYWORDS = {"pickaxe", "pick", "mining", "shovel", "drill", "harvest", "hoe", "spade", "lumber", "chop", "farm", "gather"}
@@ -91,6 +94,7 @@ local function ToggleAutoSwing()
         UpdateToggleState(AutoGunToggle, false)
     end
     UpdateToggleState(AutoSwingToggle, Flags.AutoSwing)
+    if Flags.AutoSwing then task.spawn(EquipBestWeaponForMode) end
 end
 
 local function ToggleAutoGun()
@@ -100,6 +104,7 @@ local function ToggleAutoGun()
         UpdateToggleState(AutoSwingToggle, false)
     end
     UpdateToggleState(AutoGunToggle, Flags.AutoGun)
+    if Flags.AutoGun then task.spawn(EquipBestWeaponForMode) end
 end
 
 local function ToggleAutoTeleport()
@@ -309,6 +314,20 @@ local function GetBestGunWeapon()
     return best
 end
 
+-- Assigned here after GetBestMeleeWeapon and GetBestGunWeapon are defined.
+-- Immediately equips the best weapon for whichever mode (AutoGun / AutoSwing) is enabled.
+EquipBestWeaponForMode = function()
+    local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+    if not hum then return end
+    if Flags.AutoGun then
+        local best = GetBestGunWeapon()
+        if best then hum:EquipTool(best) end
+    elseif Flags.AutoSwing then
+        local best = GetBestMeleeWeapon()
+        if best then hum:EquipTool(best) end
+    end
+end
+
 local function GetSummonerFromBackpack()
     local backpack = LocalPlayer:FindFirstChild("Backpack")
     if backpack then
@@ -384,16 +403,17 @@ local function ActivateSummonerTool(tool)
         pcall(function() re:FireServer("hit", {80, 1}) end)
     end
 
+    -- Re-equip the correct weapon 0.5s after summoning (live reference, not name lookup),
+    -- then clear IsSummoning 0.15s later to give the equip animation time to settle.
     task.delay(0.5, function()
-        local bestWeapon = Flags.AutoGun and GetBestGunWeapon() or GetBestMeleeWeapon()
-        if bestWeapon then
-            EquipWeaponByName(bestWeapon.Name)
-        elseif LastEquippedWeapon then
-            EquipWeaponByName(LastEquippedWeapon)
+        local hum2 = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+        if hum2 then
+            local bestWeapon = Flags.AutoGun and GetBestGunWeapon() or GetBestMeleeWeapon()
+            if bestWeapon then hum2:EquipTool(bestWeapon) end
         end
-        task.delay(0.15, function()
-            IsSummoning = false
-        end)
+    end)
+    task.delay(0.65, function()
+        IsSummoning = false
     end)
 end
 
@@ -703,8 +723,9 @@ end
 
 local function PerformSwordAttack()
     if IsSummoning then return end
-    -- Swords fire via RF:InvokeServer("hit", {dmg, 1}) from wherever they are (backpack or char).
-    -- They do NOT need to be equipped — firing directly avoids displacing the equipped gun.
+    -- Swords fire via RF:InvokeServer("hit", {dmg, 1}).
+    -- GetBestMeleeWeapon searches both backpack and character, so this works whether
+    -- the sword is equipped (in Character) or sitting in the Backpack.
     local tool = GetBestMeleeWeapon()
     if not tool then return end
     local rf = tool:FindFirstChild("RemoteFunction")
@@ -720,7 +741,7 @@ local function PerformGunAttack()
     if IsSummoning then return end
     local tool = GetEquippedTool()
 
-    -- Equip the best gun if no tool, a summoner, or a non-ranged (melee) weapon is currently equipped
+    -- Equip the best gun if no tool is equipped, or if a summoner/melee is equipped
     if not tool or IsSummonerTool(tool) or not IsRangedWeapon(tool) then
         local best = GetBestGunWeapon()
         if best then
@@ -733,8 +754,8 @@ local function PerformGunAttack()
     end
 
     if not tool then return end
-    if IsSummonerTool(tool) then return end
-    if IsNonCombatTool(tool) then return end
+    -- tool is non-nil from here; re-check that it is still a valid gun
+    if IsSummonerTool(tool) or IsNonCombatTool(tool) then return end
     -- Guns fire via RE:FireServer("hit", {mhit=Vector3}) only — no RF
     local re = tool:FindFirstChild("RemoteEvent")
     if not re then return end
@@ -1134,10 +1155,11 @@ AutoSwingToggle = KillAuraSection:AddToggle({
             Flags.AutoGun = false
             UpdateToggleState(AutoGunToggle, false)
         end
+        if v then task.spawn(EquipBestWeaponForMode) end
     end
 })
 AutoSwingToggle.Link:AddKeybind({Default = "V", Flag = "SwingKeybind", Callback = ToggleAutoSwing})
-AutoSwingToggle.Link:AddHelper({Text = "Swords (RF): fires from backpack, no equip needed"})
+AutoSwingToggle.Link:AddHelper({Text = "Swords (RF): equips best sword for visibility, fires via RF"})
 
 AutoGunToggle = KillAuraSection:AddToggle({
     Name = "Auto Gun", Flag = "AutoGun", Default = false,
@@ -1147,10 +1169,11 @@ AutoGunToggle = KillAuraSection:AddToggle({
             Flags.AutoSwing = false
             UpdateToggleState(AutoSwingToggle, false)
         end
+        if v then task.spawn(EquipBestWeaponForMode) end
     end
 })
 AutoGunToggle.Link:AddKeybind({Default = "B", Flag = "GunKeybind", Callback = ToggleAutoGun})
-AutoGunToggle.Link:AddHelper({Text = "Guns (RE only, no RF): equips gun, fires via RE"})
+AutoGunToggle.Link:AddHelper({Text = "Guns (RE only, no RF): equips best gun immediately"})
 
 AutoSummonToggle = KillAuraSection:AddToggle({
     Name = "Auto Summon", Flag = "AutoSummon", Default = false,
