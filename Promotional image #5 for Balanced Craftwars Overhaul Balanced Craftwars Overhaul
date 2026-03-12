@@ -753,12 +753,13 @@ local function PerformSwordAttack()
     if IsSummoning then return end
     if not GetCurrentTarget() then return end
 
-    -- Prefer the currently equipped tool: if the player manually equipped a sword
-    -- (or any tool with a RemoteFunction), fire it directly without any classification.
+    -- Prefer the currently equipped tool if it is a non-summoner combat tool
+    -- (has RemoteFunction OR RemoteEvent). Craftwars swords may use either remote
+    -- for their attack, so we accept both rather than requiring only RF.
     local tool = nil
     local equipped = GetEquippedTool()
     if equipped and not IsSummonerTool(equipped) and not IsNonCombatTool(equipped)
-        and equipped:FindFirstChild("RemoteFunction") then
+        and (equipped:FindFirstChild("RemoteFunction") or equipped:FindFirstChild("RemoteEvent")) then
         tool = equipped
     end
 
@@ -768,12 +769,14 @@ local function PerformSwordAttack()
     end
 
     if not tool then return end
-    local rf = tool:FindFirstChild("RemoteFunction")
-    if not rf then return end
     local dmgVal = tool:FindFirstChild("Damage")
     local dmg = dmgVal and tonumber(dmgVal.Value) or 80
     LastEquippedWeapon = tool.Name
-    pcall(function() rf:InvokeServer("hit", {dmg, 1}) end)
+    -- Fire whichever remotes the tool has (swords use RF, RE, or both).
+    local rf = tool:FindFirstChild("RemoteFunction")
+    local re = tool:FindFirstChild("RemoteEvent")
+    if rf then pcall(function() rf:InvokeServer("hit", {dmg, 1}) end) end
+    if re then pcall(function() re:FireServer("hit", {dmg, 1}) end) end
 end
 
 local function PerformGunAttack()
@@ -1212,7 +1215,7 @@ AutoSwingToggle = KillAuraSection:AddToggle({
         end
     end
 })
-AutoSwingToggle.Link:AddKeybind({Default = "V", Flag = "SwingKeybind", Callback = function() end})
+AutoSwingToggle.Link:AddKeybind({Default = "V", Flag = "SwingKeybind", Callback = function(v) Flags.SwingKeybind = v end})
 AutoSwingToggle.Link:AddHelper({Text = "Fires melee weapon RF without switching your equipped slot"})
 
 AutoGunToggle = KillAuraSection:AddToggle({
@@ -1225,14 +1228,14 @@ AutoGunToggle = KillAuraSection:AddToggle({
         end
     end
 })
-AutoGunToggle.Link:AddKeybind({Default = "B", Flag = "GunKeybind", Callback = function() end})
+AutoGunToggle.Link:AddKeybind({Default = "B", Flag = "GunKeybind", Callback = function(v) Flags.GunKeybind = v end})
 AutoGunToggle.Link:AddHelper({Text = "Fires gun RE without switching your equipped slot"})
 
 AutoSummonToggle = KillAuraSection:AddToggle({
     Name = "Auto Summon", Flag = "AutoSummon", Default = false,
     Callback = function(v) Flags.AutoSummon = v end
 })
-AutoSummonToggle.Link:AddKeybind({Default = "G", Flag = "SummonKeybind", Callback = function() end})
+AutoSummonToggle.Link:AddKeybind({Default = "G", Flag = "SummonKeybind", Callback = function(v) Flags.SummonKeybind = v end})
 AutoSummonToggle.Link:AddHelper({Text = "Uses summon items automatically"})
 
 EnemyESPToggle = KillAuraSection:AddToggle({
@@ -1319,7 +1322,7 @@ AutoTeleportToggle = TeleportSection:AddToggle({
     Name = "Auto Teleport", Flag = "AutoTeleport", Default = false,
     Callback = function(v) Flags.AutoTeleport = v end
 })
-AutoTeleportToggle.Link:AddKeybind({Default = "N", Flag = "TeleportKeybind", Callback = function() end})
+AutoTeleportToggle.Link:AddKeybind({Default = "N", Flag = "TeleportKeybind", Callback = function(v) Flags.TeleportKeybind = v end})
 AutoTeleportToggle.Link:AddHelper({Text = "Teleports next to your target (keybind remappable)"})
 
 TeleportSection:AddDropdown({
