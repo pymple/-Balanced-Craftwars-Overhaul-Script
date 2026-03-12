@@ -41,6 +41,7 @@ local ItemLogMap = {}
 local TotalItemsCollected = 0
 local ItemSearchQuery = ""
 local ItemListParagraph = nil
+local ItemCountParagraph = nil
 local ProcessedMessages = {}
 local MAX_PROCESSED = 200
 
@@ -307,18 +308,9 @@ local function PerformSwordAttack()
 end
 
 -- AUTO GUN: Fires at the target using ALL known gun patterns.
--- Detects which type of gun is equipped and uses the correct remote.
---
--- Type 1 (AUG, Old Construct Rifle): Has RemoteEvent
---   → RE:FireServer("hit", {["mhit"] = Vector3})
---
--- Type 2 (Inglaciator): Has GunThrowerMain LocalScript, uses RemoteFunction
---   → RF:InvokeServer("shoot", {CFrame, damage})
---   The CFrame must be from the character's position aimed at the enemy.
---   The damage arg is typically the tool's Damage value or a small int.
---
+-- Type 1 (AUG, Old Construct Rifle): RemoteEvent:FireServer("hit", {["mhit"] = Vector3})
+-- Type 2 (Inglaciator): RemoteFunction:InvokeServer("shoot", {CFrame, damage})
 -- We detect which type and fire accordingly. We also try both as fallback.
-
 local function PerformGunAttack()
     local tool = GetEquippedTool()
     if not tool then return end
@@ -359,8 +351,6 @@ local function PerformGunAttack()
 
     -- TYPE 2: RemoteFunction "shoot" guns (Inglaciator, etc.)
     -- Pattern: RF:InvokeServer("shoot", {CFrame, damage})
-    -- Only fire "shoot" if we detected ranged properties OR there's no RemoteEvent
-    -- (if a sword's RF is present we don't want to send "shoot" to it)
     if rf and (isShootGun or not re) then
         pcall(function() rf:InvokeServer("shoot", {aimCF, dmg}) end)
     end
@@ -444,12 +434,6 @@ local function BuildItemListText()
     end
 
     local lines = {}
-
-    -- Centered header line (no dashes)
-    local header = "[ " .. #ItemLog .. " unique  |  " .. TotalItemsCollected .. " total ]"
-    table.insert(lines, header)
-    table.insert(lines, "") -- blank line spacer
-
     for _, entry in ipairs(items) do
         local line = "x" .. entry.totalQty .. "  " .. entry.name
         table.insert(lines, line)
@@ -458,18 +442,32 @@ local function BuildItemListText()
     return table.concat(lines, "\n")
 end
 
+local function BuildCountTitle()
+    return #ItemLog .. " unique | " .. TotalItemsCollected .. " total"
+end
+
 function RefreshItemList()
-    if not ItemListParagraph then return end
-    pcall(function()
-        local text = BuildItemListText()
-        if ItemListParagraph.SetContent then
-            ItemListParagraph:SetContent(text)
-        elseif ItemListParagraph.Set then
-            ItemListParagraph:Set(text)
-        elseif ItemListParagraph.SetText then
-            ItemListParagraph:SetText(text)
-        end
-    end)
+    -- Update the count paragraph title
+    if ItemCountParagraph then
+        pcall(function()
+            if ItemCountParagraph.SetTitle then
+                ItemCountParagraph:SetTitle(BuildCountTitle())
+            end
+        end)
+    end
+    -- Update the item list paragraph content
+    if ItemListParagraph then
+        pcall(function()
+            local text = BuildItemListText()
+            if ItemListParagraph.SetContent then
+                ItemListParagraph:SetContent(text)
+            elseif ItemListParagraph.Set then
+                ItemListParagraph:Set(text)
+            elseif ItemListParagraph.SetText then
+                ItemListParagraph:SetText(text)
+            end
+        end)
+    end
 end
 
 local function CleanMessage(text)
@@ -784,31 +782,6 @@ SpeedSection:AddButton({
     end
 })
 
-SpeedSection:AddButton({
-    Name = "Debug Weapon Remotes",
-    Callback = function()
-        local tool = GetEquippedTool()
-        if not tool then
-            Notifier.new({Title = "Error", Content = "No weapon equipped", Duration = 2, Icon = AVATAR_ICON})
-            return
-        end
-        local info = "Tool: " .. tool.Name
-        local hasRF = tool:FindFirstChild("RemoteFunction") and "Yes" or "No"
-        local hasRE = tool:FindFirstChild("RemoteEvent") and "Yes" or "No"
-        info = info .. "\nRemoteFunction: " .. hasRF
-        info = info .. "\nRemoteEvent: " .. hasRE
-        local isShoot = tool:FindFirstChild("GunThrowerMain") ~= nil
-            or tool:FindFirstChild("RangedSpread") ~= nil
-            or tool:FindFirstChild("RangedPower") ~= nil
-        info = info .. "\nShoot-type gun: " .. (isShoot and "Yes" or "No")
-        info = info .. "\nChildren:"
-        for _, c in ipairs(tool:GetChildren()) do
-            info = info .. "\n  " .. c.Name .. " [" .. c.ClassName .. "]"
-        end
-        Notifier.new({Title = "Weapon Debug", Content = info, Duration = 10, Icon = AVATAR_ICON})
-    end
-})
-
 -- ==================== TELEPORT TAB ====================
 Window:DrawCategory({Name = "TELEPORTATION"})
 local TeleportTab = Window:DrawTab({Name = "Teleport", Icon = "map-pin", EnableScrolling = true})
@@ -915,6 +888,7 @@ CurrentTargetSection:AddButton({
 -- ==================== ITEM COLLECTION (in Stats tab) ====================
 local ItemSection = StatsTab:DrawSection({Name = "Item Collection", Position = "left"})
 
+-- Search bar
 ItemSection:AddTextBox({
     Name = "Search",
     Placeholder = "Filter items...",
@@ -925,11 +899,19 @@ ItemSection:AddTextBox({
     end
 })
 
+-- Count header — uses paragraph Title which pimpleHUB renders centered/bold
+ItemCountParagraph = ItemSection:AddParagraph({
+    Title = "0 unique | 0 total",
+    Content = ""
+})
+
+-- Item list — content gets updated dynamically
 ItemListParagraph = ItemSection:AddParagraph({
     Title = "Drops",
     Content = "Waiting for drops..."
 })
 
+-- Clear button
 ItemSection:AddButton({
     Name = "Clear Item Log",
     Callback = function()
@@ -973,7 +955,6 @@ MovementSection:AddButton({
         Flags.WalkSpeed = 16
         Flags.JumpPower = 50
         ApplyMovementStats()
-        Notifier.new({Title = "Reset", Content = "Speed: 16 | Jump: 50", Duration = 2, Icon = AVATAR_ICON})
     end
 })
 
